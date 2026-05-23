@@ -11,15 +11,16 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
 WORKDIR /workspace
+ENV QA_MODEL_NAME=distilbert/distilbert-base-cased-distilled-squad
 
 # Installs your dependencies.
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "from transformers import AutoModelForQuestionAnswering, AutoTokenizer; import os; name = os.environ['QA_MODEL_NAME']; AutoTokenizer.from_pretrained(name).save_pretrained('qa_model'); AutoModelForQuestionAnswering.from_pretrained(name).save_pretrained('qa_model')"
 
 # Copies your source files.
 COPY src .
-COPY nlp.jsonl .
 
 # Starts your model server.
 CMD uvicorn nlp_server:app --port 5004 --host 0.0.0.0
