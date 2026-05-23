@@ -4,3 +4,4 @@ fastapi==0.115.12
 uvicorn[standard]==0.34.2
 ultralytics==8.3.146
 pillow==11.2.1
+ensemble-boxes==1.0.9

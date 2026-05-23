@@ -15,9 +15,18 @@ ENV YOLO_CONFIG_DIR=/tmp/ultralytics
 ENV MPLCONFIGDIR=/tmp/matplotlib
 ENV CV_MODEL_NAME=yolov8x-worldv2.pt
 ENV CV_IMGSZ=1280
-ENV CV_CONF=0.12
+# The evaluator scores every detection at 1.0, so false positives count as
+# heavily as true positives against precision. Stay conservative.
+ENV CV_CONF=0.30
 ENV CV_IOU=0.55
-ENV CV_MAX_DET=50
+ENV CV_MAX_DET=60
+ENV CV_TTA=1
+ENV CV_WBF_IOU=0.55
+ENV CV_WBF_SKIP=0.001
+# Where the manager looks for a fine-tuned closed-vocab YOLO checkpoint.
+# Drop a cv_finetuned.pt next to the source files (and add to repo) to
+# upgrade the detector from open-vocab to trained closed-vocab.
+ENV CV_FINETUNED_PATH=/workspace/cv_finetuned.pt
 
 # Installs system libraries required by OpenCV, which Ultralytics imports.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,9 +42,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -c "from ultralytics import YOLOWorld; import os; model = YOLOWorld(os.environ['CV_MODEL_NAME']); model.set_classes(['cargo aircraft','cargo plane','transport aircraft','commercial aircraft','passenger aircraft','airliner','airplane','drone','uav','unmanned aerial vehicle','quadcopter','fighter jet','jet fighter','military jet','fighter plane','military aircraft','warplane','helicopter','chopper','light aircraft','small airplane','private aircraft','missile','rocket projectile','truck','lorry','car','automobile','tank','armored tank','military tank','bus','coach bus','van','minivan','cargo ship','container ship','freighter','yacht','motor yacht','cruise ship','passenger ship','warship','naval ship','military ship','sailboat','sailing boat'])"
 
-# Copies your source files.
+# Pre-download the YOLO-World fallback weights so first-call latency stays low.
+# Use the same descriptive single-prompt-per-category list that cv_manager.py
+# applies at runtime; this is what gets cached into the model file.
+RUN python -c "from ultralytics import YOLOWorld; import os; model = YOLOWorld(os.environ['CV_MODEL_NAME']); model.set_classes(['cargo airplane','passenger airliner','drone','fighter jet','military propeller airplane','helicopter','small private airplane','missile','truck','car','military tank','bus','van','cargo ship','yacht','cruise ship','warship','sailboat'])"
+
+# Copies your source files. If cv_finetuned.pt is included in src/, the
+# manager will prefer it over the YOLO-World fallback.
 COPY src .
 
 # Starts your model server.
