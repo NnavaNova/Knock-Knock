@@ -217,9 +217,13 @@ def main() -> None:
     yaml_path = _write_dataset_yaml(work_root)
     print(f"Dataset config: {yaml_path}")
 
-    base = os.environ.get("CV_TRAIN_BASE", "yolo11x.pt")
+    # Defaults tuned for a T4 (~14.5 GB usable). yolo11x at batch=8 imgsz=1280
+    # OOMs on T4 — use yolo11l (~25M params, only ~1 mAP behind 11x on COCO,
+    # and the gap shrinks further with fine-tuning) at a slightly smaller
+    # image size. If you have an A100/L4/H100 you can bump these up via env.
+    base = os.environ.get("CV_TRAIN_BASE", "yolo11l.pt")
     epochs = int(os.environ.get("CV_TRAIN_EPOCHS", "60"))
-    imgsz = int(os.environ.get("CV_TRAIN_IMGSZ", "1280"))
+    imgsz = int(os.environ.get("CV_TRAIN_IMGSZ", "1024"))
     batch = int(os.environ.get("CV_TRAIN_BATCH", "8"))
     project = str(work_root / "runs")
 
