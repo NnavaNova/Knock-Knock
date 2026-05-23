@@ -17,6 +17,16 @@ ENV CV_CONF=0.12
 ENV CV_IOU=0.55
 ENV CV_MAX_DET=50
 
+# Installs system libraries required by OpenCV, which Ultralytics imports.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Installs your dependencies.
 RUN pip install -U pip
 COPY requirements.txt .
