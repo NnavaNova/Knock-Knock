@@ -12,7 +12,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
 WORKDIR /workspace
 ENV ASR_MODEL_NAME=openai/whisper-large-v3-turbo
-ENV ASR_LANGUAGE=english
+ENV ASR_LANGUAGE=auto
+ENV ASR_CHUNK_LENGTH_S=30
 
 # Installs your dependencies.
 RUN pip install -U pip

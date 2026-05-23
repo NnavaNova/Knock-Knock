@@ -26,8 +26,9 @@ class ASRManager:
         self.model_name = os.getenv(
             "ASR_MODEL_NAME", "openai/whisper-large-v3-turbo"
         )
-        self.language = os.getenv("ASR_LANGUAGE", "english").strip().lower()
+        self.language = os.getenv("ASR_LANGUAGE", "auto").strip().lower()
         self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "4")))
+        self.chunk_length_s = float(os.getenv("ASR_CHUNK_LENGTH_S", "30"))
         self.pipe = None
         self._load_model()
 
@@ -56,7 +57,7 @@ class ASRManager:
         if isinstance(results, dict):
             results = [results]
 
-        return [self._clean_transcript(result.get("text", "")) for result in results]
+        return [self._result_text(result) for result in results]
 
     def _load_model(self) -> None:
         model_paths = [
@@ -89,6 +90,8 @@ class ASRManager:
                 low_cpu_mem_usage=True,
                 use_safetensors=True,
             )
+            model.config.forced_decoder_ids = None
+            model.generation_config.forced_decoder_ids = None
             model.to(device)
             model.eval()
 
@@ -100,6 +103,8 @@ class ASRManager:
                 feature_extractor=processor.feature_extractor,
                 torch_dtype=torch_dtype,
                 device=device_index,
+                chunk_length_s=self.chunk_length_s,
+                stride_length_s=(4, 2),
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to load ASR model from {model_id}") from exc
@@ -139,6 +144,13 @@ class ASRManager:
             except Exception as exc:
                 LOGGER.warning("ASR retry failed with kwargs %s: %s", kwargs, exc)
         return {"text": ""}
+
+    def _result_text(self, result: object) -> str:
+        if isinstance(result, dict):
+            return self._clean_transcript(str(result.get("text", "")))
+        if isinstance(result, str):
+            return self._clean_transcript(result)
+        return ""
 
     def _decode_audio(self, audio_bytes: bytes) -> dict:
         try:
