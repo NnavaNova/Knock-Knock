@@ -20,4 +20,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src .
 
 # Starts your model server.
-CMD uvicorn ae_server:app --port 5005 --host 0.0.0.0
+CMD ["uvicorn", "ae_server:app", "--port", "5005", "--host", "0.0.0.0"]

@@ -1,9 +1,3 @@
-"""Runs the AE server."""
-
-# Unless you want to do something special with the server, you shouldn't need
-# to change anything in this file.
-
-
 from ae_manager import AEManager
 from fastapi import FastAPI, Request
 
@@ -17,22 +11,28 @@ async def ae(request: Request) -> dict[str, list[dict[str, int]]]:
 
     Returns action taken given current observation (int)
     """
+    try:
+        input_json = await request.json()
+    except Exception:
+        input_json = {}
 
-    # get observation, feed into model
-    input_json = await request.json()
+    if not input_json or "instances" not in input_json:
+        manager.reset()
+        return {"predictions": []}
 
     predictions = []
     # each is a dict with one key "observation" and the value as a dictionary observation
-    for instance in input_json["instances"]:
-        observation = instance["observation"]
+    for instance in input_json.get("instances", []):
+        observation = instance.get("observation", {})
         # reset environment on a new round
-        if observation["step"] == 0:
-            await reset({})
+        if observation.get("step", 0) == 0:
+            manager.reset()
         predictions.append({"action": manager.ae(observation)})
     return {"predictions": predictions}
 
 
 @app.post("/reset")
+@app.get("/reset")
 async def reset(_: Request) -> None:
     """Resets the `AEManager` for a new round."""
 
