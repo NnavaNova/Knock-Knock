@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
 WORKDIR /workspace
-ENV QA_MODEL_NAME=distilbert/distilbert-base-cased-distilled-squad
+ENV QA_MODEL_NAME=deepset/roberta-base-squad2
 
 # Installs your dependencies.
 RUN pip install -U pip

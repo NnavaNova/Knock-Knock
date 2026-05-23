@@ -192,11 +192,20 @@ class NLPManager:
     def _answer_from_ranked_chunks(
         self, question: str, ranked_chunks: list[tuple[float, Chunk]]
     ) -> str:
+        model_answer, model_score = self._model_answer_with_score(
+            question, ranked_chunks
+        )
+
+        # High-confidence model answer overrides rule-based extraction.
+        # Log-prob threshold: -3.5 corresponds to roughly start_prob * end_prob > 0.03,
+        # which is "the model is reasonably sure about both endpoints."
+        if model_answer and model_score > -3.5:
+            return model_answer
+
         direct_answer = self._direct_answer(question, ranked_chunks)
         if direct_answer:
             return direct_answer
 
-        model_answer = self._model_answer(question, ranked_chunks)
         if model_answer:
             return model_answer
 
@@ -2272,59 +2281,128 @@ class NLPManager:
     def _model_answer(
         self, question: str, ranked_chunks: list[tuple[float, Chunk]]
     ) -> str:
-        if self.qa_tokenizer is None or self.qa_model is None or self.qa_device is None:
-            return ""
+        answer, _ = self._model_answer_with_score(question, ranked_chunks)
+        return answer
 
-        context = self._model_context(question, ranked_chunks)
-        if not context:
-            return ""
+    def _model_answer_with_score(
+        self, question: str, ranked_chunks: list[tuple[float, Chunk]]
+    ) -> tuple[str, float]:
+        """Run extractive QA on the top retrieved chunks individually.
+
+        Returns the highest-scoring (answer, log-probability score). Scoring
+        each chunk separately lets us trust the model only when it is locally
+        confident, instead of diluting confidence across one merged context.
+        """
+        if self.qa_tokenizer is None or self.qa_model is None or self.qa_device is None:
+            return "", -1e9
+
+        # Combined context (legacy behavior) + a few individual top chunks.
+        # The combined context helps multi-part questions; individual chunks
+        # give cleaner per-snippet confidence.
+        contexts: list[str] = []
+        seen_keys: set[str] = set()
+
+        combined = self._model_context(question, ranked_chunks)
+        if combined:
+            contexts.append(combined)
+            seen_keys.add(combined[:200].lower())
+
+        for _, chunk in ranked_chunks[:8]:
+            text = self._clean_text(chunk.text)
+            if not text:
+                continue
+            key = text[:200].lower()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            contexts.append(text)
+            if len(contexts) >= 6:
+                break
+
+        if not contexts:
+            return "", -1e9
 
         try:
             import torch
+            import torch.nn.functional as F
+        except Exception:
+            return "", -1e9
 
-            inputs = self.qa_tokenizer(
-                question,
-                context,
-                max_length=384,
-                truncation="only_second",
-                stride=96,
-                return_overflowing_tokens=True,
-                return_offsets_mapping=True,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            offsets = inputs.pop("offset_mapping")
-            inputs = {key: value.to(self.qa_device) for key, value in inputs.items()}
-            with torch.no_grad():
-                outputs = self.qa_model(**inputs)
+        best_answer = ""
+        best_score = -1e9
 
-            best_score = -1e9
-            best_answer = ""
+        for context in contexts:
+            try:
+                inputs = self.qa_tokenizer(
+                    question,
+                    context,
+                    max_length=384,
+                    truncation="only_second",
+                    stride=128,
+                    return_overflowing_tokens=True,
+                    return_offsets_mapping=True,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                offsets_batched = inputs.pop("offset_mapping")
+                inputs.pop("overflow_to_sample_mapping", None)
+                model_inputs = {
+                    key: value.to(self.qa_device) for key, value in inputs.items()
+                }
+                with torch.no_grad():
+                    outputs = self.qa_model(**model_inputs)
+            except Exception:
+                continue
+
             for feature_index in range(outputs.start_logits.shape[0]):
                 start_logits = outputs.start_logits[feature_index]
                 end_logits = outputs.end_logits[feature_index]
-                feature_offsets = offsets[feature_index].tolist()
-                top_starts = torch.topk(start_logits, k=8).indices.tolist()
-                top_ends = torch.topk(end_logits, k=8).indices.tolist()
-                for start_index in top_starts:
-                    for end_index in top_ends:
-                        if end_index < start_index or end_index - start_index > 24:
-                            continue
-                        start_char, _ = feature_offsets[start_index]
-                        _, end_char = feature_offsets[end_index]
-                        if start_char == end_char:
+                feature_offsets = offsets_batched[feature_index].tolist()
+
+                # Mask out positions that aren't in the context (the question
+                # tokens and padding have offsets (0, 0)). CLS is also (0, 0)
+                # which doubles as the SQuAD2 "no answer" position — excluding
+                # it forces the model to commit to a span.
+                valid = [
+                    i
+                    for i, (start, end) in enumerate(feature_offsets)
+                    if start != end
+                ]
+                if not valid:
+                    continue
+                valid_t = torch.tensor(valid, device=start_logits.device)
+
+                start_logprob = F.log_softmax(start_logits, dim=-1)
+                end_logprob = F.log_softmax(end_logits, dim=-1)
+
+                valid_start_lp = start_logprob[valid_t]
+                valid_end_lp = end_logprob[valid_t]
+
+                topk = min(15, len(valid))
+                top_start_idx = torch.topk(valid_start_lp, k=topk).indices.tolist()
+                top_end_idx = torch.topk(valid_end_lp, k=topk).indices.tolist()
+
+                for si in top_start_idx:
+                    for ei in top_end_idx:
+                        if ei < si or ei - si > 28:
                             continue
                         score = (
-                            start_logits[start_index].item()
-                            + end_logits[end_index].item()
+                            valid_start_lp[si].item() + valid_end_lp[ei].item()
                         )
-                        if score > best_score:
-                            best_score = score
-                            best_answer = context[start_char:end_char]
+                        if score <= best_score:
+                            continue
+                        start_char, _ = feature_offsets[valid[si]]
+                        _, end_char = feature_offsets[valid[ei]]
+                        if start_char >= end_char:
+                            continue
+                        candidate = context[start_char:end_char]
+                        cleaned = self._clean_answer_phrase(candidate)
+                        if not cleaned:
+                            continue
+                        best_score = score
+                        best_answer = cleaned
 
-            return self._clean_answer_phrase(best_answer)
-        except Exception:
-            return ""
+        return best_answer, best_score
 
     def _model_context(
         self, question: str, ranked_chunks: list[tuple[float, Chunk]]
