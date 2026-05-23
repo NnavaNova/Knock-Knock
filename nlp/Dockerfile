@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copies your source files.
 COPY src .
+COPY nlp.jsonl .
 
 # Starts your model server.
 CMD uvicorn nlp_server:app --port 5004 --host 0.0.0.0
