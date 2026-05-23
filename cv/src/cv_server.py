@@ -30,15 +30,10 @@ async def cv(request: Request) -> dict[str, list[list[dict[str, Any]]]]:
 
     inputs_json = await request.json()
 
-    predictions = []
-    for instance in inputs_json["instances"]:
-
-        # Reads the base-64 encoded image and decodes it into bytes.
-        image_bytes = base64.b64decode(instance["b64"])
-
-        # Performs object detection and appends the result.
-        detections = manager.cv(image_bytes)
-        predictions.append(detections)
+    image_items = [
+        base64.b64decode(instance["b64"]) for instance in inputs_json["instances"]
+    ]
+    predictions = manager.cv_batch(image_items)
 
     return {"predictions": predictions}
 
