@@ -11,11 +11,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
 WORKDIR /workspace
+ENV ASR_MODEL_NAME=openai/whisper-large-v3-turbo
+ENV ASR_LANGUAGE=english
 
 # Installs your dependencies.
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor; import os; name = os.environ['ASR_MODEL_NAME']; AutoProcessor.from_pretrained(name).save_pretrained('asr_model'); AutoModelForSpeechSeq2Seq.from_pretrained(name, use_safetensors=True, low_cpu_mem_usage=True).save_pretrained('asr_model', safe_serialization=True)"
 
 # Copies your source files.
 COPY src .
