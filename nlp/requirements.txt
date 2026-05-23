@@ -4,3 +4,5 @@ fastapi==0.115.12
 uvicorn[standard]==0.34.2
 transformers==4.52.4
 safetensors==0.5.3
+sentencepiece==0.2.0
+protobuf==5.29.3

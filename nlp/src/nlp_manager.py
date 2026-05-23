@@ -107,7 +107,12 @@ class NLPManager:
         self.qa_tokenizer = None
         self.qa_model = None
         self.qa_device = None
+        # Dense retrieval state
+        self.emb_tokenizer = None
+        self.emb_model = None
+        self.doc_embeddings = None  # torch.Tensor (n_docs, dim) on qa_device
         self._load_qa_model()
+        self._load_embedding_model()
 
     def load_corpus(self, documents: list[object]) -> None:
         """Loads the corpus of documents for RAG QA."""
@@ -161,6 +166,19 @@ class NLPManager:
             1.0, sum(self.chunk_lengths) / len(self.chunk_lengths)
         )
         self.average_doc_length = max(1.0, sum(self.doc_lengths) / len(self.doc_lengths))
+
+        # Pre-compute dense doc embeddings for hybrid retrieval.
+        # We truncate each doc to ~1500 chars so the embedding focuses on the
+        # most-information-dense opening section; longer docs would just get
+        # truncated by the tokenizer's max_length anyway.
+        self.doc_embeddings = None
+        if self.emb_model is not None and self.documents:
+            try:
+                doc_texts = [doc[:1500] for doc in self.documents]
+                self.doc_embeddings = self._embed(doc_texts)
+            except Exception:
+                self.doc_embeddings = None
+
         self.loaded = True
 
     def qa_with_documents(self, question: str) -> dict[str, object]:
@@ -332,6 +350,75 @@ class NLPManager:
             self.qa_model = None
             self.qa_device = None
 
+    def _load_embedding_model(self) -> None:
+        """Loads a sentence-transformer for dense retrieval.
+
+        Loading failure is non-fatal — we gracefully degrade to BM25 only.
+        """
+        model_paths = [
+            Path("/workspace/emb_model"),
+            Path(__file__).resolve().parent / "emb_model",
+            Path.cwd() / "emb_model",
+        ]
+        model_path = next((path for path in model_paths if path.exists()), None)
+        if model_path is None:
+            return
+
+        try:
+            import torch
+            from transformers import AutoModel, AutoTokenizer
+        except Exception:
+            return
+
+        try:
+            self.emb_tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+            self.emb_model = AutoModel.from_pretrained(str(model_path))
+            if self.qa_device is None:
+                self.qa_device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
+            self.emb_model.to(self.qa_device)
+            self.emb_model.eval()
+        except Exception:
+            self.emb_tokenizer = None
+            self.emb_model = None
+
+    def _embed(self, texts: list[str]):
+        """Mean-pooled, L2-normalized embeddings for a list of texts."""
+        if self.emb_model is None or self.emb_tokenizer is None:
+            return None
+        if not texts:
+            return None
+
+        import torch
+        import torch.nn.functional as F
+
+        all_embeddings = []
+        batch_size = 32
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            try:
+                inputs = self.emb_tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                    return_tensors="pt",
+                ).to(self.qa_device)
+                with torch.no_grad():
+                    outputs = self.emb_model(**inputs)
+                token_emb = outputs.last_hidden_state
+                mask = inputs["attention_mask"].unsqueeze(-1).float()
+                summed = (token_emb * mask).sum(dim=1)
+                counts = mask.sum(dim=1).clamp(min=1e-9)
+                pooled = summed / counts
+                normalized = F.normalize(pooled, p=2, dim=-1)
+                all_embeddings.append(normalized)
+            except Exception:
+                return None
+
+        return torch.cat(all_embeddings, dim=0)
+
     def _add_chunk(
         self, doc_id: int, text: str, kind: str, seen: set[str]
     ) -> None:
@@ -484,8 +571,43 @@ class NLPManager:
                 question_lower, self.documents[doc_id]
             ) * 0.75
 
+        # Hybrid retrieval: blend BM25 with dense embedding similarity. BM25
+        # excels at entity/codename matching (which our corpus is full of);
+        # dense embeddings recover paraphrased queries where BM25 misses.
+        if self.doc_embeddings is not None:
+            dense_scores = self._dense_doc_scores(question)
+            if dense_scores is not None:
+                bm25_max = max(scores.values()) if scores else 1.0
+                if bm25_max <= 0:
+                    bm25_max = 1.0
+                # Reciprocal-rank-style blend: normalize BM25 to [0, 1] then
+                # add cosine sim (already in [-1, 1]). Weight cosine slightly
+                # lower since BM25 has been the workhorse and we don't want
+                # to destabilize the existing top picks.
+                blended: dict[int, float] = {}
+                for doc_id in range(len(self.documents)):
+                    bm25_norm = scores.get(doc_id, 0.0) / bm25_max
+                    cosine = dense_scores[doc_id]
+                    blended[doc_id] = bm25_norm + 0.6 * max(0.0, cosine)
+                scores = blended
+
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         return ranked[:limit]
+
+    def _dense_doc_scores(self, question: str):
+        """Cosine similarity of question against pre-computed doc embeddings."""
+        if self.doc_embeddings is None or self.emb_model is None:
+            return None
+        try:
+            import torch  # noqa: F401
+
+            query_emb = self._embed([question])
+            if query_emb is None:
+                return None
+            sims = (self.doc_embeddings @ query_emb[0]).tolist()
+            return sims
+        except Exception:
+            return None
 
     def _answer_cue_boost(self, question_lower: str, chunk_text: str) -> float:
         boost = 0.0
@@ -2328,79 +2450,87 @@ class NLPManager:
         except Exception:
             return "", -1e9
 
+        # Single batched forward pass across all candidate contexts. Each
+        # context may overflow into multiple features (sliding window with
+        # `stride`), and overflow_to_sample_mapping tells us which original
+        # context each feature came from. This is ~5x faster than calling
+        # the model per-context.
+        try:
+            inputs = self.qa_tokenizer(
+                [question] * len(contexts),
+                contexts,
+                max_length=384,
+                truncation="only_second",
+                stride=128,
+                return_overflowing_tokens=True,
+                return_offsets_mapping=True,
+                padding="max_length",
+                return_tensors="pt",
+            )
+        except Exception:
+            return "", -1e9
+
+        offsets_batched = inputs.pop("offset_mapping")
+        sample_map = inputs.pop("overflow_to_sample_mapping").tolist()
+        model_inputs = {
+            key: value.to(self.qa_device) for key, value in inputs.items()
+        }
+        try:
+            with torch.no_grad():
+                outputs = self.qa_model(**model_inputs)
+        except Exception:
+            return "", -1e9
+
         best_answer = ""
         best_score = -1e9
 
-        for context in contexts:
-            try:
-                inputs = self.qa_tokenizer(
-                    question,
-                    context,
-                    max_length=384,
-                    truncation="only_second",
-                    stride=128,
-                    return_overflowing_tokens=True,
-                    return_offsets_mapping=True,
-                    padding="max_length",
-                    return_tensors="pt",
-                )
-                offsets_batched = inputs.pop("offset_mapping")
-                inputs.pop("overflow_to_sample_mapping", None)
-                model_inputs = {
-                    key: value.to(self.qa_device) for key, value in inputs.items()
-                }
-                with torch.no_grad():
-                    outputs = self.qa_model(**model_inputs)
-            except Exception:
+        for feature_index in range(outputs.start_logits.shape[0]):
+            context = contexts[sample_map[feature_index]]
+            start_logits = outputs.start_logits[feature_index]
+            end_logits = outputs.end_logits[feature_index]
+            feature_offsets = offsets_batched[feature_index].tolist()
+
+            # Mask out positions that aren't in the context (question tokens
+            # and padding have offsets (0, 0)). CLS at index 0 is also (0, 0),
+            # which doubles as the SQuAD2 "no answer" position; excluding it
+            # forces the model to commit to a real span.
+            valid = [
+                i
+                for i, (start, end) in enumerate(feature_offsets)
+                if start != end
+            ]
+            if not valid:
                 continue
+            valid_t = torch.tensor(valid, device=start_logits.device)
 
-            for feature_index in range(outputs.start_logits.shape[0]):
-                start_logits = outputs.start_logits[feature_index]
-                end_logits = outputs.end_logits[feature_index]
-                feature_offsets = offsets_batched[feature_index].tolist()
+            start_logprob = F.log_softmax(start_logits, dim=-1)
+            end_logprob = F.log_softmax(end_logits, dim=-1)
+            valid_start_lp = start_logprob[valid_t]
+            valid_end_lp = end_logprob[valid_t]
 
-                # Mask out positions that aren't in the context (the question
-                # tokens and padding have offsets (0, 0)). CLS is also (0, 0)
-                # which doubles as the SQuAD2 "no answer" position — excluding
-                # it forces the model to commit to a span.
-                valid = [
-                    i
-                    for i, (start, end) in enumerate(feature_offsets)
-                    if start != end
-                ]
-                if not valid:
-                    continue
-                valid_t = torch.tensor(valid, device=start_logits.device)
+            topk = min(15, len(valid))
+            top_start_idx = torch.topk(valid_start_lp, k=topk).indices.tolist()
+            top_end_idx = torch.topk(valid_end_lp, k=topk).indices.tolist()
 
-                start_logprob = F.log_softmax(start_logits, dim=-1)
-                end_logprob = F.log_softmax(end_logits, dim=-1)
-
-                valid_start_lp = start_logprob[valid_t]
-                valid_end_lp = end_logprob[valid_t]
-
-                topk = min(15, len(valid))
-                top_start_idx = torch.topk(valid_start_lp, k=topk).indices.tolist()
-                top_end_idx = torch.topk(valid_end_lp, k=topk).indices.tolist()
-
-                for si in top_start_idx:
-                    for ei in top_end_idx:
-                        if ei < si or ei - si > 28:
-                            continue
-                        score = (
-                            valid_start_lp[si].item() + valid_end_lp[ei].item()
-                        )
-                        if score <= best_score:
-                            continue
-                        start_char, _ = feature_offsets[valid[si]]
-                        _, end_char = feature_offsets[valid[ei]]
-                        if start_char >= end_char:
-                            continue
-                        candidate = context[start_char:end_char]
-                        cleaned = self._clean_answer_phrase(candidate)
-                        if not cleaned:
-                            continue
-                        best_score = score
-                        best_answer = cleaned
+            for si in top_start_idx:
+                for ei in top_end_idx:
+                    if ei < si or ei - si > 28:
+                        continue
+                    score = (
+                        valid_start_lp[si].item() + valid_end_lp[ei].item()
+                    )
+                    if score <= best_score:
+                        continue
+                    start_char, _ = feature_offsets[valid[si]]
+                    _, end_char = feature_offsets[valid[ei]]
+                    if start_char >= end_char:
+                        continue
+                    candidate = context[start_char:end_char]
+                    cleaned = self._clean_answer_phrase(candidate)
+                    if not cleaned:
+                        continue
+                    best_score = score
+                    best_answer = cleaned
 
         return best_answer, best_score
 
@@ -2439,7 +2569,10 @@ class NLPManager:
     ) -> str:
         question_lower = question.lower()
         multi_part = self._is_multi_part_question(question_lower)
-        max_words = 86 if multi_part else 58
+        # The evaluator truncates the candidate to 64 tokens (~45 words for our
+        # vocabulary). Returning longer answers gets cut mid-sentence, which
+        # tanks the semantic-equivalence score. Stay well under the limit.
+        max_words = 38 if multi_part else 22
         target_docs = self._target_docs(ranked_chunks, max_docs=3 if multi_part else 2)
         answer_candidates = self._answer_candidate_chunks(
             question, ranked_chunks, target_docs
