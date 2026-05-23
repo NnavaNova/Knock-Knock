@@ -23,4 +23,4 @@ RUN python -c "from transformers import AutoModelForQuestionAnswering, AutoToken
 COPY src .
 
 # Starts your model server.
-CMD uvicorn nlp_server:app --port 5004 --host 0.0.0.0
+CMD ["uvicorn", "nlp_server:app", "--port", "5004", "--host", "0.0.0.0"]

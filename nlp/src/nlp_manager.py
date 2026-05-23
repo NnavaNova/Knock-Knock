@@ -91,6 +91,7 @@ class NLPManager:
     def __init__(self):
         self.loaded = False
         self.documents: list[str] = []
+        self.document_ids: list[str] = []
         self.chunks: list[Chunk] = []
         self.chunk_tokens: list[Counter[str]] = []
         self.chunk_lengths: list[int] = []
@@ -108,10 +109,11 @@ class NLPManager:
         self.qa_device = None
         self._load_qa_model()
 
-    def load_corpus(self, documents: list[str]) -> None:
+    def load_corpus(self, documents: list[object]) -> None:
         """Loads the corpus of documents for RAG QA."""
 
-        self.documents = documents
+        self.documents = []
+        self.document_ids = []
         self.chunks = []
         self.chunk_tokens = []
         self.chunk_lengths = []
@@ -123,7 +125,10 @@ class NLPManager:
         self.inverted_index = {}
         self.document_frequency = {}
 
-        for doc_id, document in enumerate(documents):
+        for doc_id, raw_document in enumerate(documents):
+            document_id, document = self._normalize_document(raw_document, doc_id)
+            self.document_ids.append(document_id)
+            self.documents.append(document)
             doc_counter = Counter(self._tokenize(document))
             self.doc_tokens.append(doc_counter)
             self.doc_lengths.append(sum(doc_counter.values()))
@@ -158,6 +163,20 @@ class NLPManager:
         self.average_doc_length = max(1.0, sum(self.doc_lengths) / len(self.doc_lengths))
         self.loaded = True
 
+    def qa_with_documents(self, question: str) -> dict[str, object]:
+        """Answers a question and returns the top supporting corpus document IDs."""
+
+        if not self.loaded or not self.chunks:
+            return {"documents": [], "answer": ""}
+
+        ranked_chunks = self._rank_chunks(question, limit=18)
+        if not ranked_chunks:
+            return {"documents": [], "answer": ""}
+
+        document_ids = self._prediction_document_ids(question, ranked_chunks)
+        answer = self._answer_from_ranked_chunks(question, ranked_chunks)
+        return {"documents": document_ids, "answer": answer}
+
     def qa(self, question: str) -> str:
         """Answers a question using the loaded corpus."""
 
@@ -168,6 +187,11 @@ class NLPManager:
         if not ranked_chunks:
             return ""
 
+        return self._answer_from_ranked_chunks(question, ranked_chunks)
+
+    def _answer_from_ranked_chunks(
+        self, question: str, ranked_chunks: list[tuple[float, Chunk]]
+    ) -> str:
         direct_answer = self._direct_answer(question, ranked_chunks)
         if direct_answer:
             return direct_answer
@@ -177,6 +201,55 @@ class NLPManager:
             return model_answer
 
         return self._compose_answer(question, ranked_chunks)
+
+    def _normalize_document(self, document: object, index: int) -> tuple[str, str]:
+        if isinstance(document, dict):
+            document_id = str(
+                document.get("id")
+                or document.get("doc_id")
+                or document.get("document_id")
+                or f"DOC-{index + 1:04d}"
+            )
+            text = document.get("document")
+            if text is None:
+                text = document.get("text")
+            if text is None:
+                text = document.get("content")
+            if text is None:
+                text = " ".join(
+                    str(value)
+                    for key, value in document.items()
+                    if key not in {"id", "doc_id", "document_id"}
+                )
+            return document_id, str(text)
+
+        return f"DOC-{index + 1:04d}", str(document)
+
+    def _prediction_document_ids(
+        self, question: str, ranked_chunks: list[tuple[float, Chunk]]
+    ) -> list[str]:
+        question_lower = question.lower()
+        max_docs = 3 if self._is_multi_part_question(question_lower) else 3
+        target_docs = self._target_docs(ranked_chunks, max_docs=max_docs)
+        if not target_docs:
+            return []
+
+        doc_scores: dict[int, float] = defaultdict(float)
+        for score, chunk in ranked_chunks:
+            if chunk.doc_id in target_docs:
+                doc_scores[chunk.doc_id] += score
+
+        ordered_doc_ids = [
+            doc_id
+            for doc_id, _ in sorted(
+                doc_scores.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+        return [
+            self.document_ids[doc_id]
+            for doc_id in ordered_doc_ids[:3]
+            if 0 <= doc_id < len(self.document_ids)
+        ]
 
     def _add_document_chunks(self, doc_id: int, document: str) -> None:
         seen: set[str] = set()
