@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import math
 import os
 import re
@@ -13,13 +14,7 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 
-DOMAIN_PROMPT = (
-    "Clairos, Haven, Cascade, CGC, Clairos Governance Council, Cyanite "
-    "Industries, Phyrexis Group, Renhwa Media, Genesis Labs, ONE Network "
-    "Enterprises, The Edge Corporation, TEC, CYPHER, Floodwall, Blackshore, "
-    "Zonnon, Kashikari, Nyari, Wampa Robotics, Sarento, Tavenport, Somatic "
-    "Augmentation, Edge neural mesh, nanobots, Opting, Fullwalker, Grays."
-)
+LOGGER = logging.getLogger(__name__)
 
 
 class ASRManager:
@@ -34,7 +29,6 @@ class ASRManager:
         self.language = os.getenv("ASR_LANGUAGE", "english").strip().lower()
         self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "4")))
         self.pipe = None
-        self.prompt_ids = None
         self._load_model()
 
     def asr(self, audio_bytes: bytes) -> str:
@@ -54,20 +48,10 @@ class ASRManager:
         generate_kwargs = self._generate_kwargs()
 
         try:
-            results = self.pipe(
-                inputs,
-                batch_size=min(self.batch_size, len(inputs)),
-                generate_kwargs=generate_kwargs,
-            )
-        except Exception:
-            # Fall back to independent calls so one unusual clip does not zero
-            # the whole batch.
-            results = []
-            for item in inputs:
-                try:
-                    results.append(self.pipe(item, generate_kwargs=generate_kwargs))
-                except Exception:
-                    results.append({"text": ""})
+            results = self._infer(inputs, generate_kwargs)
+        except Exception as exc:
+            LOGGER.exception("Batched ASR inference failed; retrying per clip: %s", exc)
+            results = [self._infer_one(item, generate_kwargs) for item in inputs]
 
         if isinstance(results, dict):
             results = [results]
@@ -109,13 +93,6 @@ class ASRManager:
             model.eval()
 
             processor = AutoProcessor.from_pretrained(model_id)
-            try:
-                self.prompt_ids = processor.get_prompt_ids(
-                    DOMAIN_PROMPT, return_tensors="pt"
-                ).to(device)
-            except Exception:
-                self.prompt_ids = None
-
             self.pipe = pipeline(
                 "automatic-speech-recognition",
                 model=model,
@@ -123,8 +100,6 @@ class ASRManager:
                 feature_extractor=processor.feature_extractor,
                 torch_dtype=torch_dtype,
                 device=device_index,
-                chunk_length_s=30,
-                stride_length_s=(4, 2),
             )
         except Exception as exc:
             raise RuntimeError(f"Failed to load ASR model from {model_id}") from exc
@@ -135,16 +110,35 @@ class ASRManager:
             "num_beams": 5,
             "temperature": 0.0,
             "condition_on_prev_tokens": False,
-            "compression_ratio_threshold": 1.35,
-            "logprob_threshold": -1.0,
-            "no_speech_threshold": 0.6,
-            "return_timestamps": True,
+            "max_new_tokens": 160,
         }
         if self.language and self.language != "auto":
             kwargs["language"] = self.language
-        if self.prompt_ids is not None:
-            kwargs["prompt_ids"] = self.prompt_ids
         return kwargs
+
+    def _infer(self, inputs: list[dict], generate_kwargs: dict):
+        return self.pipe(
+            inputs,
+            batch_size=min(self.batch_size, len(inputs)),
+            generate_kwargs=generate_kwargs,
+        )
+
+    def _infer_one(self, item: dict, generate_kwargs: dict) -> dict:
+        fallback_kwargs = [
+            generate_kwargs,
+            {
+                key: generate_kwargs[key]
+                for key in ("task", "language")
+                if key in generate_kwargs
+            },
+            {},
+        ]
+        for kwargs in fallback_kwargs:
+            try:
+                return self.pipe(item, generate_kwargs=kwargs)
+            except Exception as exc:
+                LOGGER.warning("ASR retry failed with kwargs %s: %s", kwargs, exc)
+        return {"text": ""}
 
     def _decode_audio(self, audio_bytes: bytes) -> dict:
         try:

@@ -24,4 +24,4 @@ RUN python -c "from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 COPY src .
 
 # Starts your model server.
-CMD uvicorn asr_server:app --port 5001 --host 0.0.0.0
+CMD ["uvicorn", "asr_server:app", "--port", "5001", "--host", "0.0.0.0"]
