@@ -1,0 +1,9 @@
+{
+  "bias": 0.0,
+  "source:direct": 0.8,
+  "source:model": 0.2,
+  "source:generated": 0.4,
+  "source:snippet": -0.4,
+  "length": -0.015,
+  "short": 0.15
+}

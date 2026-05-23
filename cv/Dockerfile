@@ -20,7 +20,7 @@ ENV CV_IMGSZ=1280
 ENV CV_CONF=0.30
 ENV CV_IOU=0.55
 ENV CV_MAX_DET=60
-ENV CV_TTA=1
+ENV CV_TTA=auto
 ENV CV_WBF_IOU=0.55
 ENV CV_WBF_SKIP=0.001
 # Where the manager looks for a fine-tuned closed-vocab YOLO checkpoint.

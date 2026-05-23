@@ -6,23 +6,12 @@
 
 from fastapi import FastAPI, Request
 from nlp_manager import NLPManager
-from threading import Lock, Thread
+from threading import Lock
 
 app = FastAPI()
 manager = NLPManager()
 load_lock = Lock()
 load_status = {"loading": False, "error": ""}
-
-
-def _load_corpus_in_background(documents: list[object]) -> None:
-    global load_status
-    try:
-        manager.load_corpus(documents)
-        with load_lock:
-            load_status = {"loading": False, "error": ""}
-    except Exception as exc:
-        with load_lock:
-            load_status = {"loading": False, "error": str(exc)}
 
 
 @app.post("/nlp")
@@ -55,17 +44,16 @@ async def nlp(request: Request) -> dict[str, list[dict]]:
         with load_lock:
             if manager.loaded:
                 return {"predictions": [{"status": "loaded"}]}
-            if load_status["loading"]:
-                return {"predictions": [{"status": "loading"}]}
             load_status["loading"] = True
             load_status["error"] = ""
-
-        Thread(
-            target=_load_corpus_in_background,
-            args=(instances[0]["documents"],),
-            daemon=True,
-        ).start()
-        return {"predictions": [{"status": "loading"}]}
+            try:
+                manager.load_corpus(instances[0]["documents"])
+                load_status["loading"] = False
+            except Exception as exc:
+                load_status["loading"] = False
+                load_status["error"] = str(exc)
+                return {"predictions": [{"status": "error"}]}
+        return {"predictions": [{"status": "loaded"}]}
 
     predictions = []
     for instance in instances:

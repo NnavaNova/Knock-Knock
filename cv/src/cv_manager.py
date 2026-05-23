@@ -16,6 +16,7 @@ beats vanilla NMS by 1-3 mAP. The merger preserves localization quality
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 from pathlib import Path
@@ -70,12 +71,17 @@ class CVManager:
         self.confidence = float(os.getenv("CV_CONF", "0.30"))
         self.iou = float(os.getenv("CV_IOU", "0.55"))
         self.max_det = int(os.getenv("CV_MAX_DET", "60"))
-        self.use_tta = os.getenv("CV_TTA", "1") != "0"
+        self.tta_setting = os.getenv("CV_TTA", "auto").strip().lower()
+        self.use_tta = self.tta_setting not in {"0", "false", "off", "no"}
         self.wbf_iou = float(os.getenv("CV_WBF_IOU", "0.55"))
         self.wbf_skip_thr = float(os.getenv("CV_WBF_SKIP", "0.001"))
         self.model = None
         self.is_finetuned = False
         self.num_classes = len(CATEGORY_PROMPTS)
+        self.class_thresholds = {
+            category_id: self.confidence for category_id in range(self.num_classes)
+        }
+        self._load_class_thresholds()
         self.load_error = ""
         self._tried_loading = False
 
@@ -159,6 +165,8 @@ class CVManager:
 
                 self.model = YOLO(str(self.finetuned_path))
                 self.is_finetuned = True
+                if self.tta_setting == "auto":
+                    self.use_tta = False
                 try:
                     self.model.fuse()
                 except Exception:
@@ -196,7 +204,7 @@ class CVManager:
             results = self.model.predict(
                 images,
                 imgsz=self.image_size,
-                conf=self.confidence,
+                conf=min(self.class_thresholds.values(), default=self.confidence),
                 iou=self.iou,
                 max_det=self.max_det,
                 agnostic_nms=False,
@@ -227,6 +235,8 @@ class CVManager:
         for box, cls_id, conf in zip(xyxy, classes, confs):
             category_id = self._map_class_to_category(int(cls_id))
             if category_id is None:
+                continue
+            if float(conf) < self.class_thresholds.get(category_id, self.confidence):
                 continue
             x1, y1, x2, y2 = (float(v) for v in box)
             x1 = max(0.0, min(x1, image_width - 1.0))
@@ -260,6 +270,22 @@ class CVManager:
         if 0 <= cls_id < self.num_classes:
             return cls_id
         return None
+
+    def _load_class_thresholds(self) -> None:
+        threshold_path = Path(__file__).resolve().parent / "cv_thresholds.json"
+        if not threshold_path.exists():
+            return
+        try:
+            loaded = json.loads(threshold_path.read_text())
+            self.class_thresholds.update(
+                {
+                    int(category_id): float(threshold)
+                    for category_id, threshold in loaded.items()
+                    if 0 <= int(category_id) < self.num_classes
+                }
+            )
+        except Exception as exc:
+            LOGGER.warning("Could not load CV thresholds from %s: %s", threshold_path, exc)
 
     # ------------------------------------------------------------ TTA glue
 

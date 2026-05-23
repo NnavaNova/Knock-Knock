@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import os
 from typing import Any, Callable, Iterable
 
 import numpy as np
@@ -52,6 +53,14 @@ BLAST_RADIUS = 2
 MAX_PLAN_DEPTH = 48
 STALE_ENEMY_STEPS = 4
 STALE_COLLECTIBLE_STEPS = 70
+RESPAWN_STEPS = 40
+
+MISSION_MULT = float(os.getenv("AE_MISSION_MULT", "1.2"))
+RESOURCE_MULT = float(os.getenv("AE_RESOURCE_MULT", "1.5"))
+RECON_MULT = float(os.getenv("AE_RECON_MULT", "0.8"))
+VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.25"))
+BOMB_BASE_BONUS = float(os.getenv("AE_BOMB_BASE_BONUS", "35"))
+DESTRUCTIBLE_OPEN_THRESHOLD = float(os.getenv("AE_DESTRUCTIBLE_OPEN_THRESHOLD", "5"))
 
 Coord = tuple[int, int]
 Edge = tuple[Coord, Coord]
@@ -63,6 +72,12 @@ COLLECTIBLE_VALUES = {
     "mission": 5.0,
     "resource": 2.0,
     "recon": 1.0,
+}
+
+TARGET_MULTIPLIERS = {
+    "mission": MISSION_MULT,
+    "resource": RESOURCE_MULT,
+    "recon": RECON_MULT,
 }
 
 COLLECTIBLE_CHANNELS = (
@@ -105,6 +120,8 @@ class AEManager:
         self.destructible_edges: set[Edge] = set()
         self.seen_cells: set[Coord] = set()
         self.collectibles: dict[Coord, TargetInfo] = {}
+        self.known_collectibles: dict[Coord, TargetInfo] = {}
+        self.collected_until: dict[Coord, int] = {}
         self.ally_bases: set[Coord] = set()
         self.enemy_bases: dict[Coord, TargetInfo] = {}
         self.enemies: dict[Coord, TargetInfo] = {}
@@ -117,6 +134,7 @@ class AEManager:
         self.last_step: int | None = None
         self.just_placed_bomb = False
         self.stuck_steps = 0
+        self._load_fixed_map()
 
     def ae(self, observation: dict[str, Any]) -> int:
         step = self._read_int(observation.get("step"), 0)
@@ -133,6 +151,7 @@ class AEManager:
         self._age_state(step)
         self._record_failed_move(location, direction, step)
         self._ingest_observation(observation, step)
+        self._mark_collected(location, step)
         self._trim_stale_state(step)
 
         if location is None:
@@ -248,9 +267,16 @@ class AEManager:
                 )
                 break
         if found is None:
-            self.collectibles.pop(pos, None)
+            previous = self.collectibles.pop(pos, None)
+            if previous is not None:
+                self.known_collectibles[pos] = previous
+                self.collected_until[pos] = max(
+                    self.collected_until.get(pos, 0), step + RESPAWN_STEPS
+                )
         else:
             self.collectibles[pos] = found
+            self.known_collectibles[pos] = found
+            self.collected_until.pop(pos, None)
 
     def _update_entities(self, pos: Coord, cell: np.ndarray, step: int) -> None:
         if cell[CH_ALLY_BASE] > 0.5:
@@ -305,6 +331,17 @@ class AEManager:
         for pos, target in list(self.collectibles.items()):
             if step - target.last_seen > STALE_COLLECTIBLE_STEPS:
                 self.collectibles.pop(pos, None)
+        for pos, until in list(self.collected_until.items()):
+            if until + STALE_COLLECTIBLE_STEPS < step:
+                self.collected_until.pop(pos, None)
+
+    def _mark_collected(self, location: Coord | None, step: int) -> None:
+        if location is None:
+            return
+        known = self.collectibles.pop(location, None)
+        if known is not None:
+            self.known_collectibles[location] = known
+            self.collected_until[location] = step + RESPAWN_STEPS
 
     def _record_failed_move(
         self, location: Coord | None, direction: int, step: int
@@ -339,7 +376,7 @@ class AEManager:
             if escape is not None:
                 return escape
 
-        if self._should_place_bomb(location, direction, action_mask, team_bombs):
+        if self._should_place_bomb(location, direction, action_mask, team_bombs, step):
             return PLACE_BOMB
 
         target_action = self._best_target_action(location, direction, action_mask, step)
@@ -358,6 +395,7 @@ class AEManager:
         direction: int,
         action_mask: list[int],
         team_bombs: int,
+        step: int,
     ) -> bool:
         if (
             team_bombs <= 0
@@ -376,57 +414,63 @@ class AEManager:
             if self._bomb_hits(location, pos):
                 return True
 
-        # Opening destructible walls is useful for exploration, but only after
-        # the immediate high-value options have dried up.
-        if self.stuck_steps >= 2 or not self.collectibles:
-            for edge in self.destructible_edges:
-                if any(self._bomb_hits(location, p) for p in edge):
-                    return True
+        if self.stuck_steps >= 4:
+            edge = self._best_destructible_edge_to_open(location, direction, step)
+            if edge is not None and any(self._bomb_hits(location, p) for p in edge):
+                return True
         return False
 
     def _best_target_action(
         self, location: Coord, direction: int, action_mask: list[int], step: int
     ) -> int | None:
         candidates: list[tuple[float, Coord, str]] = []
+        reachable = self._bfs_reachable(
+            location,
+            direction,
+            action_mask,
+            max_depth=MAX_PLAN_DEPTH,
+            avoid_danger=True,
+        )
 
         for base_pos, info in self.enemy_bases.items():
             for pos in self._bombing_positions(base_pos):
                 if self._in_bounds(pos) and not self._cell_blocked(pos):
-                    candidates.append((info.value, pos, "enemy_base"))
+                    candidates.append((50.0, pos, "enemy_base"))
 
         for enemy_pos, info in self.enemies.items():
             for pos in self._bombing_positions(enemy_pos):
                 if self._in_bounds(pos) and not self._cell_blocked(pos):
-                    candidates.append((info.value, pos, "enemy"))
+                    candidates.append((15.0, pos, "enemy"))
 
-        for pos, info in self.collectibles.items():
+        for pos, info in self._available_collectibles(step).items():
             age_penalty = max(0, step - info.last_seen) * 0.03
-            candidates.append((info.value * 9.0 - age_penalty, pos, info.kind))
+            multiplier = TARGET_MULTIPLIERS.get(info.kind, 1.0)
+            candidates.append((info.value * multiplier - age_penalty, pos, info.kind))
 
         best_score = -1e9
         best: SearchResult | None = None
         for value, target, kind in candidates:
-            result = self._search(
-                location,
-                direction,
-                action_mask,
-                goal=lambda p, _d, t=target: p == t,
-                max_depth=MAX_PLAN_DEPTH,
-                avoid_danger=True,
-            )
+            result = self._best_reachable_result(reachable, target)
             if result is None:
                 continue
-            end_bonus = 0.0
+            adjusted_value = value
             if kind in ("enemy_base", "enemy") and self._escape_exists_after_bomb(
                 result.end_pos, result.end_dir
             ):
-                end_bonus = 20.0
-            score = value + end_bonus - result.distance * 0.9 - self.visited[target] * 0.35
+                adjusted_value += BOMB_BASE_BONUS
+            novelty_bonus = 1.0 if self._has_unknown_neighbor(target) else 0.0
+            risk_penalty = 1.0 if self._danger_at(target, result.distance + 1) else 0.0
+            score = (
+                adjusted_value / (result.distance + 1.0)
+                + 0.20 * novelty_bonus
+                - VISIT_PENALTY * self.visited[target]
+                - 4.0 * risk_penalty
+            )
             if score > best_score:
                 best_score = score
                 best = result
 
-        if best is not None and best_score > -5.0:
+        if best is not None and best_score > 0.05:
             return best.first_action
         return None
 
@@ -550,6 +594,66 @@ class AEManager:
                 )
         return None
 
+    def _bfs_reachable(
+        self,
+        start_pos: Coord,
+        start_dir: int,
+        action_mask: list[int],
+        max_depth: int,
+        avoid_danger: bool = True,
+    ) -> dict[tuple[Coord, int], SearchResult]:
+        queue: deque[tuple[Coord, int, int, int | None]] = deque()
+        queue.append((start_pos, start_dir, 0, None))
+        seen: set[tuple[Coord, int]] = {(start_pos, start_dir)}
+        best: dict[tuple[Coord, int], SearchResult] = {}
+
+        while queue:
+            pos, direction, depth, first_action = queue.popleft()
+            if depth > 0:
+                best.setdefault(
+                    (pos, direction),
+                    SearchResult(
+                        first_action=first_action if first_action is not None else STAY,
+                        distance=depth,
+                        end_pos=pos,
+                        end_dir=direction,
+                    ),
+                )
+            if depth >= max_depth:
+                continue
+
+            for action in (FORWARD, BACKWARD, LEFT, RIGHT, STAY):
+                if depth == 0 and not self._legal(action_mask, action):
+                    continue
+                next_pos, next_dir = self._transition(pos, direction, action)
+                if next_pos != pos and self._movement_blocked(pos, next_pos):
+                    continue
+                next_depth = depth + 1
+                if avoid_danger and self._danger_at(next_pos, next_depth):
+                    continue
+                state = (next_pos, next_dir)
+                if state in seen:
+                    continue
+                seen.add(state)
+                queue.append(
+                    (
+                        next_pos,
+                        next_dir,
+                        next_depth,
+                        action if first_action is None else first_action,
+                    )
+                )
+        return best
+
+    @staticmethod
+    def _best_reachable_result(
+        reachable: dict[tuple[Coord, int], SearchResult], target: Coord
+    ) -> SearchResult | None:
+        matches = [result for (pos, _direction), result in reachable.items() if pos == target]
+        if not matches:
+            return None
+        return min(matches, key=lambda result: result.distance)
+
     def _transition(self, pos: Coord, direction: int, action: int) -> tuple[Coord, int]:
         direction %= 4
         if action == LEFT:
@@ -614,6 +718,75 @@ class AEManager:
                     positions.append(pos)
         return positions
 
+    def _available_collectibles(self, step: int) -> dict[Coord, TargetInfo]:
+        available = dict(self.collectibles)
+        for pos, info in self.known_collectibles.items():
+            if pos in available:
+                continue
+            if self.collected_until.get(pos, -1) <= step:
+                available[pos] = info
+        return available
+
+    def _best_destructible_edge_to_open(
+        self, location: Coord, direction: int, step: int
+    ) -> Edge | None:
+        best_edge: Edge | None = None
+        best_gain = 0.0
+        for edge in self.destructible_edges:
+            if not any(self._bomb_hits(location, pos) for pos in edge):
+                continue
+            gain = self._edge_opens_value(edge, location, direction, step)
+            if gain > best_gain:
+                best_gain = gain
+                best_edge = edge
+        if best_gain > DESTRUCTIBLE_OPEN_THRESHOLD:
+            return best_edge
+        return None
+
+    def _edge_opens_value(
+        self, edge: Edge, location: Coord, direction: int, step: int
+    ) -> float:
+        before = self._reachable_target_value(location, direction, step, depth=16)
+        had_wall = edge in self.walls
+        had_dwall = edge in self.destructible_edges
+        self.walls.discard(edge)
+        self.destructible_edges.discard(edge)
+        try:
+            after = self._reachable_target_value(location, direction, step, depth=16)
+        finally:
+            if had_wall:
+                self.walls.add(edge)
+            if had_dwall:
+                self.destructible_edges.add(edge)
+        return after - before
+
+    def _reachable_target_value(
+        self, location: Coord, direction: int, step: int, depth: int
+    ) -> float:
+        reachable = self._bfs_reachable(
+            location,
+            direction,
+            [1, 1, 1, 1, 1, 0],
+            max_depth=depth,
+            avoid_danger=True,
+        )
+        value = 0.0
+        for pos, info in self._available_collectibles(step).items():
+            result = self._best_reachable_result(reachable, pos)
+            if result is not None:
+                value += (
+                    info.value
+                    * TARGET_MULTIPLIERS.get(info.kind, 1.0)
+                    / (result.distance + 1.0)
+                )
+        for base_pos in self.enemy_bases:
+            for pos in self._bombing_positions(base_pos):
+                result = self._best_reachable_result(reachable, pos)
+                if result is not None:
+                    value += 50.0 / (result.distance + 1.0)
+                    break
+        return value
+
     def _escape_exists_after_bomb(self, location: Coord, direction: int) -> bool:
         future_bomb = ((location, BOMB_TIMER),)
         result = self._search(
@@ -649,9 +822,62 @@ class AEManager:
                 return True
         return False
 
+    def _bomb_hits(self, bomb_pos: Coord, pos: Coord) -> bool:
+        if max(abs(bomb_pos[0] - pos[0]), abs(bomb_pos[1] - pos[1])) > BLAST_RADIUS:
+            return False
+        return self._los_clear(bomb_pos, pos)
+
+    def _los_clear(self, start: Coord, end: Coord) -> bool:
+        if start == end:
+            return True
+        path = self._supercover_line(start, end)
+        for idx in range(len(path) - 1):
+            cx, cy = path[idx]
+            nx, ny = path[idx + 1]
+            dx = nx - cx
+            dy = ny - cy
+            if dx != 0 and dy != 0:
+                horiz0 = self._edge_between((cx, cy), (nx, cy))
+                horiz1 = self._edge_between((nx, cy), (nx, ny))
+                vert0 = self._edge_between((cx, cy), (cx, ny))
+                vert1 = self._edge_between((cx, ny), (nx, ny))
+                h_blocked = (horiz0 in self.walls) or (horiz1 in self.walls)
+                v_blocked = (vert0 in self.walls) or (vert1 in self.walls)
+                if h_blocked and v_blocked:
+                    return False
+            else:
+                edge = self._edge_between((cx, cy), (nx, ny))
+                if edge in self.walls:
+                    return False
+        return True
+
     @staticmethod
-    def _bomb_hits(bomb_pos: Coord, pos: Coord) -> bool:
-        return max(abs(bomb_pos[0] - pos[0]), abs(bomb_pos[1] - pos[1])) <= BLAST_RADIUS
+    def _supercover_line(start: Coord, end: Coord) -> list[Coord]:
+        x0, y0 = start
+        x1, y1 = end
+        tiles = [(x0, y0)]
+        dx = x1 - x0
+        dy = y1 - y0
+        nx = abs(dx)
+        ny = abs(dy)
+        sign_x = 1 if dx > 0 else -1 if dx < 0 else 0
+        sign_y = 1 if dy > 0 else -1 if dy < 0 else 0
+        px, py = x0, y0
+        ix = iy = 0
+        while ix < nx or iy < ny:
+            if (1 + 2 * ix) * ny == (1 + 2 * iy) * nx:
+                px += sign_x
+                py += sign_y
+                ix += 1
+                iy += 1
+            elif (1 + 2 * ix) * ny < (1 + 2 * iy) * nx:
+                px += sign_x
+                ix += 1
+            else:
+                py += sign_y
+                iy += 1
+            tiles.append((px, py))
+        return tiles
 
     def _bomb_distance_score(self, pos: Coord, action: int) -> float:
         relevant = [
@@ -677,6 +903,27 @@ class AEManager:
     @staticmethod
     def _in_bounds(pos: Coord) -> bool:
         return 0 <= pos[0] < GRID_SIZE and 0 <= pos[1] < GRID_SIZE
+
+    def _load_fixed_map(self) -> None:
+        try:
+            from fixed_map import FIXED_DESTRUCTIBLE_EDGES, FIXED_WALLS
+        except Exception:
+            return
+        self.walls.update(self._normalize_edges(FIXED_WALLS))
+        self.destructible_edges.update(self._normalize_edges(FIXED_DESTRUCTIBLE_EDGES))
+
+    @staticmethod
+    def _normalize_edges(edges: Iterable[object]) -> set[Edge]:
+        normalized: set[Edge] = set()
+        for edge in edges:
+            try:
+                a, b = edge  # type: ignore[misc]
+                ca = (int(a[0]), int(a[1]))
+                cb = (int(b[0]), int(b[1]))
+            except Exception:
+                continue
+            normalized.add((ca, cb) if ca <= cb else (cb, ca))
+        return normalized
 
     # ------------------------------------------------------------------
     # Generic helpers

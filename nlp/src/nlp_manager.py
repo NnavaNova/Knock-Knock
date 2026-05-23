@@ -87,6 +87,15 @@ class Chunk:
     word_count: int
 
 
+@dataclass(frozen=True)
+class AnswerCandidate:
+    answer: str
+    source: str
+    score: float
+    docs: tuple[int, ...]
+    length: int
+
+
 class NLPManager:
     def __init__(self):
         self.loaded = False
@@ -112,6 +121,8 @@ class NLPManager:
         self.emb_tokenizer = None
         self.emb_model = None
         self.doc_embeddings = None  # torch.Tensor (n_docs, dim) on qa_device
+        self.chunk_embeddings = None  # torch.Tensor (n_chunks, dim) on qa_device
+        self.candidate_ranker = self._load_candidate_ranker()
         self._load_qa_model()
         self._load_embedding_model()
 
@@ -130,6 +141,8 @@ class NLPManager:
         self.doc_frequency = {}
         self.inverted_index = {}
         self.document_frequency = {}
+        self.doc_embeddings = None
+        self.chunk_embeddings = None
 
         for doc_id, raw_document in enumerate(documents):
             document_id, document = self._normalize_document(raw_document, doc_id)
@@ -180,6 +193,12 @@ class NLPManager:
             except Exception:
                 self.doc_embeddings = None
 
+            try:
+                chunk_texts = [chunk.text[:900] for chunk in self.chunks]
+                self.chunk_embeddings = self._embed(chunk_texts)
+            except Exception:
+                self.chunk_embeddings = None
+
         self.loaded = True
 
     def qa_with_documents(self, question: str) -> dict[str, object]:
@@ -211,35 +230,44 @@ class NLPManager:
     def _answer_from_ranked_chunks(
         self, question: str, ranked_chunks: list[tuple[float, Chunk]]
     ) -> str:
+        candidates: list[AnswerCandidate] = []
+
         # Generative path (FLAN-T5 or similar). When a seq2seq model is
         # loaded, we trust its synthesized answer first — it can reshape,
         # paraphrase, and lightly compute in ways the extractive head can't.
         if self.is_generative and self.qa_model is not None:
             generated = self._generate_answer(question, ranked_chunks)
             if generated:
-                return generated
-            # Hard fallback for the rare generation failure.
-            direct_answer = self._direct_answer(question, ranked_chunks)
-            if direct_answer:
-                return direct_answer
-            return self._compose_answer(question, ranked_chunks)
+                candidates.append(
+                    self._make_candidate(generated, "generated", 5.5, ranked_chunks)
+                )
 
-        # Extractive path (kept as a backward-compatible fallback if a
-        # SQuAD-style model is mounted instead of a seq2seq one).
         model_answer, model_score = self._model_answer_with_score(
             question, ranked_chunks
         )
-        if model_answer and model_score > -3.5:
-            return model_answer
+        if model_answer:
+            candidates.append(
+                self._make_candidate(
+                    model_answer,
+                    "model",
+                    4.0 + max(-3.0, min(4.0, model_score)),
+                    ranked_chunks,
+                )
+            )
 
         direct_answer = self._direct_answer(question, ranked_chunks)
         if direct_answer:
-            return direct_answer
+            candidates.append(
+                self._make_candidate(direct_answer, "direct", 8.0, ranked_chunks)
+            )
 
-        if model_answer:
-            return model_answer
+        composed = self._compose_answer(question, ranked_chunks)
+        if composed:
+            candidates.append(
+                self._make_candidate(composed, "snippet", 2.0, ranked_chunks)
+            )
 
-        return self._compose_answer(question, ranked_chunks)
+        return self._select_answer_candidate(question, candidates)
 
     def _generate_answer(
         self, question: str, ranked_chunks: list[tuple[float, Chunk]]
@@ -343,6 +371,100 @@ class NLPManager:
         if len(words) > 45:
             text = " ".join(words[:45])
         return text
+
+    def _make_candidate(
+        self,
+        answer: str,
+        source: str,
+        score: float,
+        ranked_chunks: list[tuple[float, Chunk]],
+    ) -> AnswerCandidate:
+        answer = self._clean_answer_phrase(answer)
+        docs = tuple(dict.fromkeys(chunk.doc_id for _, chunk in ranked_chunks[:4]))
+        return AnswerCandidate(
+            answer=answer,
+            source=source,
+            score=score,
+            docs=docs,
+            length=len(answer.split()),
+        )
+
+    def _select_answer_candidate(
+        self, question: str, candidates: list[AnswerCandidate]
+    ) -> str:
+        valid = [
+            candidate
+            for candidate in candidates
+            if candidate.answer and 1 <= candidate.length <= 45
+        ]
+        if not valid:
+            fallback = min(
+                (candidate for candidate in candidates if candidate.answer),
+                key=lambda candidate: candidate.length,
+                default=None,
+            )
+            if fallback is None:
+                return ""
+            return " ".join(fallback.answer.split()[:45])
+
+        question_lower = question.lower()
+        asks_numeric = any(
+            marker in question_lower
+            for marker in (
+                "how many",
+                "how much",
+                "what share",
+                "what fraction",
+                "what proportion",
+                "what percentage",
+                "by how many",
+                "what date",
+                "deadline",
+                "threshold",
+            )
+        )
+        asks_explanatory = question_lower.startswith(("why ", "how did", "how does"))
+
+        def score(candidate: AnswerCandidate) -> float:
+            text = candidate.answer
+            lower = text.lower()
+            value = candidate.score
+            if asks_numeric and re.search(r"\d|percent|percentage|half|third|quarter", lower):
+                value += 2.5
+            if not asks_explanatory and candidate.length > 24:
+                value -= 1.2
+            if any(
+                bad in lower
+                for bad in (
+                    "according to",
+                    "the document",
+                    "the passage",
+                    "the context",
+                    "not specified in the passage",
+                )
+            ):
+                value -= 2.5
+            if candidate.source == "direct":
+                value += 1.0
+            elif candidate.source == "model" and candidate.length <= 12:
+                value += 0.6
+            elif candidate.source == "snippet" and not asks_explanatory:
+                value -= 1.0
+
+            if self.candidate_ranker:
+                value += self._ranker_adjustment(candidate)
+            return value
+
+        return max(valid, key=score).answer
+
+    def _ranker_adjustment(self, candidate: AnswerCandidate) -> float:
+        weights = self.candidate_ranker or {}
+        value = float(weights.get("bias", 0.0))
+        value += float(weights.get(f"source:{candidate.source}", 0.0))
+        value += float(weights.get("length", 0.0)) * min(candidate.length, 45)
+        if candidate.length <= 8:
+            value += float(weights.get("short", 0.0))
+        return value
 
     def _normalize_document(self, document: object, index: int) -> tuple[str, str]:
         if isinstance(document, dict):
@@ -528,6 +650,18 @@ class NLPManager:
             self.emb_tokenizer = None
             self.emb_model = None
 
+    def _load_candidate_ranker(self) -> dict[str, float] | None:
+        path = Path(__file__).resolve().parent / "candidate_ranker.json"
+        if not path.exists():
+            return None
+        try:
+            import json
+
+            loaded = json.loads(path.read_text())
+            return {str(key): float(value) for key, value in loaded.items()}
+        except Exception:
+            return None
+
     def _embed(self, texts: list[str]):
         """Mean-pooled, L2-normalized embeddings for a list of texts."""
         if self.emb_model is None or self.emb_tokenizer is None:
@@ -663,6 +797,16 @@ class NLPManager:
             elif chunk.word_count < 8:
                 scores[chunk_id] *= 0.9
 
+        dense_chunk_scores = self._dense_chunk_scores(question)
+        if dense_chunk_scores is not None and scores:
+            bm25_max = max(scores.values()) or 1.0
+            if bm25_max <= 0:
+                bm25_max = 1.0
+            for chunk_id in allowed_chunk_ids:
+                bm25_norm = scores.get(chunk_id, 0.0) / bm25_max
+                dense_score = dense_chunk_scores[chunk_id]
+                scores[chunk_id] = bm25_norm + 0.45 * max(0.0, dense_score)
+
         doc_order = [doc_id for doc_id, _ in ranked_doc_ids]
         reranked: list[tuple[float, Chunk]] = []
         for chunk_id, score in scores.items():
@@ -751,6 +895,18 @@ class NLPManager:
                 return None
             sims = (self.doc_embeddings @ query_emb[0]).tolist()
             return sims
+        except Exception:
+            return None
+
+    def _dense_chunk_scores(self, question: str):
+        """Cosine similarity of question against pre-computed chunk embeddings."""
+        if self.chunk_embeddings is None or self.emb_model is None:
+            return None
+        try:
+            query_emb = self._embed([question])
+            if query_emb is None:
+                return None
+            return (self.chunk_embeddings @ query_emb[0]).tolist()
         except Exception:
             return None
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -29,6 +30,7 @@ class ASRManager:
         self.language = os.getenv("ASR_LANGUAGE", "auto").strip().lower()
         self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "4")))
         self.chunk_length_s = float(os.getenv("ASR_CHUNK_LENGTH_S", "30"))
+        self.domain_terms, self.domain_phrases = self._load_domain_lexicon()
         self.pipe = None
         self._load_model()
 
@@ -112,10 +114,10 @@ class ASRManager:
     def _generate_kwargs(self) -> dict:
         kwargs = {
             "task": "transcribe",
-            "num_beams": 5,
+            "num_beams": int(os.getenv("ASR_NUM_BEAMS", "5")),
             "temperature": 0.0,
             "condition_on_prev_tokens": False,
-            "max_new_tokens": 160,
+            "max_new_tokens": int(os.getenv("ASR_MAX_NEW_TOKENS", "160")),
         }
         if self.language and self.language != "auto":
             kwargs["language"] = self.language
@@ -178,8 +180,38 @@ class ASRManager:
                 int(sample_rate) // gcd,
             ).astype(np.float32)
 
+        audio = self._trim_silence(audio)
         audio = self._normalize_audio(audio)
         return {"array": audio, "sampling_rate": self.target_sample_rate}
+
+    def _trim_silence(self, audio: np.ndarray) -> np.ndarray:
+        if audio.size < self.target_sample_rate // 2:
+            return audio
+
+        sr = self.target_sample_rate
+        frame = int(0.02 * sr)
+        hop = int(0.01 * sr)
+        if audio.size <= frame:
+            return audio
+
+        rms = []
+        for start in range(0, audio.size - frame + 1, hop):
+            chunk = audio[start:start + frame]
+            rms.append(float(np.sqrt(np.mean(chunk * chunk) + 1e-12)))
+
+        rms_arr = np.asarray(rms, dtype=np.float32)
+        if rms_arr.size == 0:
+            return audio
+
+        threshold = max(float(np.percentile(rms_arr, 80)) * 0.05, 1e-4)
+        active = np.where(rms_arr > threshold)[0]
+        if active.size == 0:
+            return audio
+
+        pad = int(0.20 * sr)
+        start = max(0, int(active[0]) * hop - pad)
+        end = min(audio.size, int(active[-1]) * hop + frame + pad)
+        return audio[start:end]
 
     def _normalize_audio(self, audio: np.ndarray) -> np.ndarray:
         if audio.size == 0:
@@ -198,4 +230,103 @@ class ASRManager:
         transcript = re.sub(r"\[[^\]]{0,40}\]", " ", transcript)
         transcript = re.sub(r"\([^)]{0,40}\)", " ", transcript)
         transcript = re.sub(r"\s+", " ", transcript)
-        return transcript.strip()
+        return self._domain_correct(transcript.strip())
+
+    def _load_domain_lexicon(self) -> tuple[list[str], list[str]]:
+        path = Path(__file__).resolve().parent / "domain_lexicon.json"
+        if not path.exists():
+            return [], []
+        try:
+            data = json.loads(path.read_text())
+        except Exception as exc:
+            LOGGER.warning("Could not load ASR lexicon: %s", exc)
+            return [], []
+        terms = sorted(
+            {
+                str(term).strip()
+                for term in data.get("terms", [])
+                if len(str(term).strip()) >= 5
+            },
+            key=len,
+            reverse=True,
+        )
+        phrases = sorted(
+            {
+                str(phrase).strip()
+                for phrase in data.get("phrases", [])
+                if len(str(phrase).strip().split()) >= 2
+            },
+            key=len,
+            reverse=True,
+        )
+        return terms, phrases
+
+    def _domain_correct(self, transcript: str) -> str:
+        if not transcript or not (self.domain_terms or self.domain_phrases):
+            return transcript
+        try:
+            from rapidfuzz import fuzz, process
+        except Exception:
+            return transcript
+
+        corrected = transcript
+        phrase_terms = {
+            self._score_normalize(phrase): phrase
+            for phrase in self.domain_phrases
+            if self._score_normalize(phrase)
+        }
+        if phrase_terms:
+            phrase_candidates = list(phrase_terms)
+            words = re.findall(r"\b[A-Za-z][A-Za-z'-]*\b", corrected)
+            for ngram_size in (4, 3, 2):
+                if len(words) < ngram_size:
+                    continue
+                for start in range(0, len(words) - ngram_size + 1):
+                    window = words[start:start + ngram_size]
+                    norm = self._score_normalize(" ".join(window))
+                    if len(norm) < 8:
+                        continue
+                    best = process.extractOne(norm, phrase_candidates, scorer=fuzz.ratio)
+                    if not best:
+                        continue
+                    candidate, score, _idx = best
+                    if score < 95 or candidate[:1] != norm[:1]:
+                        continue
+                    pattern = re.compile(
+                        r"\b"
+                        + r"[\s-]+".join(re.escape(part) for part in window)
+                        + r"\b",
+                        flags=re.IGNORECASE,
+                    )
+                    corrected = pattern.sub(phrase_terms[candidate], corrected, count=1)
+
+        token_terms = {
+            self._score_normalize(term): term
+            for term in self.domain_terms
+            if " " not in self._score_normalize(term)
+        }
+        if not token_terms:
+            return corrected
+
+        candidates = list(token_terms)
+
+        def replace_token(match: re.Match[str]) -> str:
+            token = match.group(0)
+            norm = self._score_normalize(token)
+            if len(norm) < 5:
+                return token
+            best = process.extractOne(norm, candidates, scorer=fuzz.ratio)
+            if not best:
+                return token
+            candidate, score, _idx = best
+            if score >= 92 and candidate[:1] == norm[:1]:
+                return token_terms[candidate]
+            return token
+
+        return re.sub(r"\b[A-Za-z][A-Za-z'-]{4,}\b", replace_token, corrected)
+
+    @staticmethod
+    def _score_normalize(text: str) -> str:
+        text = text.lower().replace("-", " ")
+        text = re.sub(r"[^a-z0-9 ]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()

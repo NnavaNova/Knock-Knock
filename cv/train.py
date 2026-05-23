@@ -1,4 +1,4 @@
-"""Fine-tune YOLO11x on the public CV training data.
+"""Fine-tune YOLO11 on the public CV training data.
 
 Run this on the GCP Workbench, NOT inside the inference Docker image.
 The output is a single file `cv/src/cv_finetuned.pt` that the inference
@@ -19,8 +19,8 @@ Usage on GCP Workbench:
 
 Override defaults with env vars:
     CV_TRAIN_DATA_DIR=/home/jupyter/novice/cv \
-    CV_TRAIN_BASE=yolo11x.pt \
-    CV_TRAIN_EPOCHS=60 \
+    CV_TRAIN_BASE=yolo11m.pt \
+    CV_TRAIN_EPOCHS=100 \
     CV_TRAIN_IMGSZ=1280 \
     CV_TRAIN_BATCH=8 \
     python cv/train.py
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -42,25 +43,29 @@ from ultralytics import YOLO
 # Must match the 18-class layout the inference manager assumes. The order
 # here IS the YOLO class index, which is also the challenge category_id.
 CATEGORY_NAMES = [
-    "cargo_airplane",
-    "passenger_airliner",
+    "cargo aircraft",
+    "commercial aircraft",
     "drone",
-    "fighter_jet",
-    "military_propeller_airplane",
+    "fighter jet",
+    "fighter plane",
     "helicopter",
-    "small_private_airplane",
+    "light aircraft",
     "missile",
     "truck",
     "car",
-    "military_tank",
+    "tank",
     "bus",
     "van",
-    "cargo_ship",
+    "cargo ship",
     "yacht",
-    "cruise_ship",
+    "cruise ship",
     "warship",
     "sailboat",
 ]
+
+
+def _norm_category_name(name: str) -> str:
+    return " ".join(name.lower().replace("_", " ").split())
 
 
 def _resolve_data_dir() -> Path:
@@ -97,7 +102,8 @@ def _convert_coco_to_yolo(src_dir: Path, out_dir: Path) -> tuple[Path, Path]:
         out_dir/images/val/*.jpg
         out_dir/labels/val/*.txt
 
-    We use a deterministic 90/10 train/val split by image id.
+    We use a deterministic class-stratified 90/10 train/val split so each
+    category is represented in validation whenever the data permits it.
     """
     ann_path = src_dir / "annotations.json"
     images_src = src_dir / "images"
@@ -112,12 +118,15 @@ def _convert_coco_to_yolo(src_dir: Path, out_dir: Path) -> tuple[Path, Path]:
     coco_cats = ann.get("categories", [])
     # If categories use the [0..17] ids, identity. Otherwise map by name.
     coco_id_to_yolo: dict[int, int] = {}
+    official_by_name = {
+        _norm_category_name(name): idx for idx, name in enumerate(CATEGORY_NAMES)
+    }
     if coco_cats:
         for entry in coco_cats:
             cat_id = entry.get("id")
-            name = (entry.get("name") or "").lower().replace(" ", "_")
-            if name in CATEGORY_NAMES:
-                coco_id_to_yolo[int(cat_id)] = CATEGORY_NAMES.index(name)
+            name = _norm_category_name(entry.get("name") or "")
+            if name in official_by_name:
+                coco_id_to_yolo[int(cat_id)] = official_by_name[name]
             elif isinstance(cat_id, int) and 0 <= cat_id < len(CATEGORY_NAMES):
                 # Annotations use raw 0..17 ids without names — trust the id.
                 coco_id_to_yolo[int(cat_id)] = int(cat_id)
@@ -130,11 +139,25 @@ def _convert_coco_to_yolo(src_dir: Path, out_dir: Path) -> tuple[Path, Path]:
     for a in ann.get("annotations", []):
         boxes_by_image[a["image_id"]].append(a)
 
-    # Deterministic split: image id modulo 10. Bucket 0 -> val (10%).
-    train_ids: list[int] = []
-    val_ids: list[int] = []
+    image_classes: dict[int, set[int]] = {}
+    class_to_images: dict[int, list[int]] = defaultdict(list)
     for img_id in sorted(images_by_id):
-        (val_ids if img_id % 10 == 0 else train_ids).append(img_id)
+        classes = {
+            coco_id_to_yolo[int(box["category_id"])]
+            for box in boxes_by_image.get(img_id, [])
+            if int(box["category_id"]) in coco_id_to_yolo
+        }
+        image_classes[img_id] = classes
+        for cls_id in classes:
+            class_to_images[cls_id].append(img_id)
+
+    train_ids, val_ids = _stratified_split(
+        sorted(images_by_id),
+        image_classes,
+        class_to_images,
+        val_fraction=float(os.getenv("CV_TRAIN_VAL_FRACTION", "0.10")),
+        seed=int(os.getenv("CV_TRAIN_SPLIT_SEED", "42")),
+    )
     print(f"Train: {len(train_ids)} images   Val: {len(val_ids)} images")
 
     img_root = out_dir / "images"
@@ -190,6 +213,64 @@ def _convert_coco_to_yolo(src_dir: Path, out_dir: Path) -> tuple[Path, Path]:
     return img_root / "train", img_root / "val"
 
 
+def _stratified_split(
+    image_ids: list[int],
+    image_classes: dict[int, set[int]],
+    class_to_images: dict[int, list[int]],
+    val_fraction: float,
+    seed: int,
+) -> tuple[list[int], list[int]]:
+    desired_val = max(1, round(len(image_ids) * val_fraction))
+    class_totals = {cls_id: len(ids) for cls_id, ids in class_to_images.items()}
+    train_counts = dict(class_totals)
+    val_counts: dict[int, int] = defaultdict(int)
+    val_set: set[int] = set()
+
+    rng = random.Random(seed)
+
+    def can_move(img_id: int) -> bool:
+        classes = image_classes.get(img_id, set())
+        if not classes:
+            return True
+        return all(train_counts.get(cls_id, 0) > 1 for cls_id in classes)
+
+    def add_val(img_id: int) -> bool:
+        if img_id in val_set or not can_move(img_id):
+            return False
+        val_set.add(img_id)
+        for cls_id in image_classes.get(img_id, set()):
+            train_counts[cls_id] -= 1
+            val_counts[cls_id] += 1
+        return True
+
+    # Seed validation with rare classes first so every class has a measured AP.
+    for cls_id in sorted(class_totals, key=lambda c: (class_totals[c], c)):
+        if val_counts[cls_id] > 0:
+            continue
+        candidates = list(class_to_images[cls_id])
+        rng.shuffle(candidates)
+        candidates.sort(key=lambda img_id: (len(image_classes.get(img_id, set())), img_id))
+        for img_id in candidates:
+            if add_val(img_id):
+                break
+
+    candidates = list(image_ids)
+    rng.shuffle(candidates)
+    candidates.sort(key=lambda img_id: (img_id % 10, img_id))
+    for img_id in candidates:
+        if len(val_set) >= desired_val:
+            break
+        add_val(img_id)
+
+    train_ids = [img_id for img_id in image_ids if img_id not in val_set]
+    val_ids = [img_id for img_id in image_ids if img_id in val_set]
+    if not train_ids:
+        raise RuntimeError("Stratified split left no training images")
+    if not val_ids:
+        raise RuntimeError("Stratified split left no validation images")
+    return train_ids, val_ids
+
+
 def _write_dataset_yaml(out_dir: Path) -> Path:
     yaml_path = out_dir / "cv_dataset.yaml"
     config = {
@@ -217,13 +298,11 @@ def main() -> None:
     yaml_path = _write_dataset_yaml(work_root)
     print(f"Dataset config: {yaml_path}")
 
-    # Defaults tuned for a T4 (~14.5 GB usable). yolo11x at batch=8 imgsz=1280
-    # OOMs on T4 — use yolo11l (~25M params, only ~1 mAP behind 11x on COCO,
-    # and the gap shrinks further with fine-tuning) at a slightly smaller
-    # image size. If you have an A100/L4/H100 you can bump these up via env.
-    base = os.environ.get("CV_TRAIN_BASE", "yolo11l.pt")
-    epochs = int(os.environ.get("CV_TRAIN_EPOCHS", "60"))
-    imgsz = int(os.environ.get("CV_TRAIN_IMGSZ", "1024"))
+    # Defaults target Novice Workbench GPUs: yolo11m is strong enough for the
+    # fixed 18-class taxonomy while leaving room for 1280px localization.
+    base = os.environ.get("CV_TRAIN_BASE", "yolo11m.pt")
+    epochs = int(os.environ.get("CV_TRAIN_EPOCHS", "100"))
+    imgsz = int(os.environ.get("CV_TRAIN_IMGSZ", "1280"))
     batch = int(os.environ.get("CV_TRAIN_BATCH", "8"))
     project = str(work_root / "runs")
 
@@ -237,20 +316,26 @@ def main() -> None:
         project=project,
         name="cv_finetune",
         exist_ok=True,
-        patience=15,
-        # Mosaic-off for the last few epochs sharpens small-object boxes —
-        # important for our high-IoU metric.
-        close_mosaic=10,
-        # Modest augmentation; the corpus already has plenty of variation.
-        mixup=0.10,
-        copy_paste=0.10,
-        hsv_h=0.015,
-        hsv_s=0.7,
-        hsv_v=0.4,
-        # Optimizer-and-schedule defaults are good for YOLO11; only nudge LR.
-        lr0=0.0025,
+        patience=25,
+        optimizer=os.getenv("CV_TRAIN_OPTIMIZER", "AdamW"),
+        lr0=float(os.getenv("CV_TRAIN_LR0", "0.0015")),
+        lrf=0.01,
         cos_lr=True,
-        plots=False,
+        warmup_epochs=3.0,
+        close_mosaic=10,
+        mosaic=0.8,
+        mixup=0.05,
+        copy_paste=0.10,
+        degrees=5.0,
+        translate=0.08,
+        scale=0.35,
+        fliplr=0.5,
+        hsv_h=0.015,
+        hsv_s=0.45,
+        hsv_v=0.25,
+        cache="disk",
+        workers=8,
+        plots=True,
     )
 
     # Locate the best checkpoint, copy to the inference path inside the repo.
