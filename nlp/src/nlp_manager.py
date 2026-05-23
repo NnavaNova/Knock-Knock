@@ -302,13 +302,14 @@ class NLPManager:
                 max_length=512,
             ).to(self.qa_device)
             with torch.no_grad():
+                # Greedy decoding: ~4x faster than beam=4 and avoids the
+                # length_penalty chopping seen in v4 where short candidates
+                # won the beam and dropped key answer qualifiers.
                 outputs = self.qa_model.generate(
                     **inputs,
-                    max_new_tokens=64,
-                    num_beams=4,
-                    early_stopping=True,
+                    max_new_tokens=48,
+                    do_sample=False,
                     no_repeat_ngram_size=3,
-                    length_penalty=0.6,
                 )
             decoded = self.qa_tokenizer.decode(
                 outputs[0], skip_special_tokens=True

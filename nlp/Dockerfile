@@ -11,14 +11,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
 WORKDIR /workspace
-ENV QA_MODEL_NAME=google/flan-t5-large
+ENV QA_MODEL_NAME=deepset/deberta-v3-base-squad2
 ENV EMB_MODEL_NAME=sentence-transformers/multi-qa-MiniLM-L6-cos-v1
 
 # Installs your dependencies.
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN python -c "from transformers import AutoModelForSeq2SeqLM, AutoTokenizer; import os; name = os.environ['QA_MODEL_NAME']; AutoTokenizer.from_pretrained(name).save_pretrained('qa_model'); AutoModelForSeq2SeqLM.from_pretrained(name).save_pretrained('qa_model')"
+RUN python -c "from transformers import AutoModelForQuestionAnswering, AutoTokenizer; import os; name = os.environ['QA_MODEL_NAME']; AutoTokenizer.from_pretrained(name).save_pretrained('qa_model'); AutoModelForQuestionAnswering.from_pretrained(name).save_pretrained('qa_model')"
 RUN python -c "from transformers import AutoModel, AutoTokenizer; import os; name = os.environ['EMB_MODEL_NAME']; AutoTokenizer.from_pretrained(name).save_pretrained('emb_model'); AutoModel.from_pretrained(name).save_pretrained('emb_model')"
 
 # Copies your source files.
