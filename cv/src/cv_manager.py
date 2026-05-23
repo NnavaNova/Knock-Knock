@@ -3,31 +3,44 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 from typing import Any
 
 from PIL import Image
 
+LOGGER = logging.getLogger(__name__)
 
-TARGET_CLASSES = [
-    "cargo aircraft",
-    "commercial aircraft",
-    "drone",
-    "fighter jet",
-    "fighter plane",
-    "helicopter",
-    "light aircraft",
-    "missile",
-    "truck",
-    "car",
-    "tank",
-    "bus",
-    "van",
-    "cargo ship",
-    "yacht",
-    "cruise ship",
-    "warship",
-    "sailboat",
+TARGET_CLASSES = {
+    0: ("cargo aircraft", "cargo plane", "transport aircraft"),
+    1: ("commercial aircraft", "passenger aircraft", "airliner", "airplane"),
+    2: ("drone", "uav", "unmanned aerial vehicle", "quadcopter"),
+    3: ("fighter jet", "jet fighter", "military jet"),
+    4: ("fighter plane", "military aircraft", "warplane"),
+    5: ("helicopter", "chopper"),
+    6: ("light aircraft", "small airplane", "private aircraft"),
+    7: ("missile", "rocket projectile"),
+    8: ("truck", "lorry"),
+    9: ("car", "automobile"),
+    10: ("tank", "armored tank", "military tank"),
+    11: ("bus", "coach bus"),
+    12: ("van", "minivan"),
+    13: ("cargo ship", "container ship", "freighter"),
+    14: ("yacht", "motor yacht"),
+    15: ("cruise ship", "passenger ship"),
+    16: ("warship", "naval ship", "military ship"),
+    17: ("sailboat", "sailing boat"),
+}
+
+MODEL_CLASSES = [
+    class_name
+    for class_aliases in TARGET_CLASSES.values()
+    for class_name in class_aliases
+]
+MODEL_CLASS_TO_CATEGORY = [
+    category_id
+    for category_id, class_aliases in TARGET_CLASSES.items()
+    for _ in class_aliases
 ]
 
 
@@ -41,19 +54,25 @@ class CVManager:
         self.iou = float(os.getenv("CV_IOU", "0.55"))
         self.max_det = int(os.getenv("CV_MAX_DET", "50"))
         self.model = None
-        self._load_model()
+        self.load_error = ""
+        self._tried_loading = False
 
     def cv(self, image: bytes) -> list[dict[str, Any]]:
         """Performs object detection on an image."""
 
         return self.cv_batch([image])[0]
 
+    def warmup(self) -> None:
+        """Best-effort model load for container startup."""
+
+        self._ensure_model()
+
     def cv_batch(self, images: list[bytes]) -> list[list[dict[str, Any]]]:
         """Performs object detection on a batch of images."""
 
         if not images:
             return []
-        if self.model is None:
+        if not self._ensure_model():
             return [[] for _ in images]
 
         decoded_images = [self._decode_image(image) for image in images]
@@ -78,7 +97,8 @@ class CVManager:
                 agnostic_nms=True,
                 verbose=False,
             )
-        except Exception:
+        except Exception as exc:
+            LOGGER.exception("CV prediction failed: %s", exc)
             return predictions
 
         if not results:
@@ -101,13 +121,29 @@ class CVManager:
 
         try:
             self.model = YOLOWorld(self.model_name)
-            self.model.set_classes(TARGET_CLASSES)
+            self.model.set_classes(MODEL_CLASSES)
             try:
                 self.model.fuse()
             except Exception:
                 pass
         except Exception as exc:
             raise RuntimeError(f"Failed to load CV model {self.model_name}") from exc
+
+    def _ensure_model(self) -> bool:
+        if self.model is not None:
+            return True
+        if self._tried_loading:
+            return False
+
+        self._tried_loading = True
+        try:
+            self._load_model()
+            self.load_error = ""
+        except Exception as exc:
+            self.model = None
+            self.load_error = str(exc)
+            LOGGER.exception("CV model failed to load: %s", exc)
+        return self.model is not None
 
     def _decode_image(self, image: bytes) -> Image.Image | None:
         try:
@@ -127,9 +163,10 @@ class CVManager:
         confs = boxes.conf.detach().cpu().numpy()
 
         detections: list[dict[str, Any]] = []
-        for box, category_id, confidence in zip(xyxy, classes, confs):
-            if not 0 <= int(category_id) < len(TARGET_CLASSES):
+        for box, model_class_id, confidence in zip(xyxy, classes, confs):
+            if not 0 <= int(model_class_id) < len(MODEL_CLASS_TO_CATEGORY):
                 continue
+            category_id = MODEL_CLASS_TO_CATEGORY[int(model_class_id)]
 
             left, top, right, bottom = [float(value) for value in box]
             left = max(0.0, min(left, image_width - 1.0))

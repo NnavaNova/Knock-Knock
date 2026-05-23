@@ -14,6 +14,11 @@ app = FastAPI()
 manager = CVManager()
 
 
+@app.on_event("startup")
+def startup() -> None:
+    manager.warmup()
+
+
 @app.post("/cv")
 async def cv(request: Request) -> dict[str, list[list[dict[str, Any]]]]:
     """Performs CV object detection on image frames.
