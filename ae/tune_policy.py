@@ -20,13 +20,15 @@ import ae_manager as policy  # noqa: E402
 
 
 GRID = {
-    "MISSION_MULT": [1.0, 1.2, 1.5],
-    "RESOURCE_MULT": [1.0, 1.5, 2.0],
-    "RECON_MULT": [0.5, 0.8, 1.0],
-    "VISIT_PENALTY": [0.15, 0.25, 0.35],
-    "BOMB_BASE_BONUS": [20.0, 35.0, 50.0],
+    "MISSION_MULT": [1.2, 1.5, 1.8],
+    "RESOURCE_MULT": [1.2, 1.6, 2.0],
+    "RECON_MULT": [0.4, 0.6, 0.8],
+    "VISIT_PENALTY": [0.10, 0.15, 0.20],
+    "BOMB_BASE_BONUS": [24.0, 35.0, 45.0],
     "MAX_PLAN_DEPTH": [32, 40, 48],
     "DESTRUCTIBLE_OPEN_THRESHOLD": [3.0, 5.0, 8.0],
+    "BASE_RUSH_STEP": [45, 60, 90],
+    "GOOD_COLLECTIBLE_SCORE": [0.5, 0.75, 1.0],
 }
 
 
@@ -45,6 +47,8 @@ def _apply_config(config: dict[str, float]) -> None:
     policy.BOMB_BASE_BONUS = float(config["BOMB_BASE_BONUS"])
     policy.MAX_PLAN_DEPTH = int(config["MAX_PLAN_DEPTH"])
     policy.DESTRUCTIBLE_OPEN_THRESHOLD = float(config["DESTRUCTIBLE_OPEN_THRESHOLD"])
+    policy.BASE_RUSH_STEP = int(config["BASE_RUSH_STEP"])
+    policy.GOOD_COLLECTIBLE_SCORE = float(config["GOOD_COLLECTIBLE_SCORE"])
     policy.TARGET_MULTIPLIERS.update(
         {
             "mission": policy.MISSION_MULT,
