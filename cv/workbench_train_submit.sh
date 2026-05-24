@@ -11,12 +11,13 @@ export TIL_FOLDER="${TIL_FOLDER:-$PWD}"
 : "${TEAM_TRACK:=novice}"
 : "${CV_TRAIN_DATA_DIR:=/home/jupyter/${TEAM_TRACK}/cv}"
 : "${CV_TRAIN_BASE:=yolo11m.pt}"
-: "${CV_TRAIN_EPOCHS:=100}"
+: "${CV_TRAIN_EPOCHS:=20}"
 : "${CV_TRAIN_IMGSZ:=1280}"
 : "${CV_TRAIN_BATCH:=2}"
 : "${CV_TRAIN_WORKERS:=4}"
 : "${CV_TRAIN_CACHE:=disk}"
-: "${CV_SUBMIT_TAG:=cv-yolo11m-1280-b2-e100}"
+: "${CV_TRAIN_PATIENCE:=6}"
+: "${CV_SUBMIT_TAG:=cv-yolo11m-1280-b2-e20}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -37,6 +38,7 @@ CV_TRAIN_IMGSZ="${CV_TRAIN_IMGSZ}" \
 CV_TRAIN_BATCH="${CV_TRAIN_BATCH}" \
 CV_TRAIN_WORKERS="${CV_TRAIN_WORKERS}" \
 CV_TRAIN_CACHE="${CV_TRAIN_CACHE}" \
+CV_TRAIN_PATIENCE="${CV_TRAIN_PATIENCE}" \
 python cv/train.py
 
 echo "Tuning per-class confidence thresholds"

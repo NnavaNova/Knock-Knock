@@ -327,11 +327,12 @@ def main() -> None:
     # Defaults target Novice Workbench GPUs: yolo11m is strong enough for the
     # fixed 18-class taxonomy while leaving room for 1280px localization.
     base = os.environ.get("CV_TRAIN_BASE", "yolo11m.pt")
-    epochs = int(os.environ.get("CV_TRAIN_EPOCHS", "100"))
+    epochs = int(os.environ.get("CV_TRAIN_EPOCHS", "20"))
     imgsz = int(os.environ.get("CV_TRAIN_IMGSZ", "1280"))
     batch = int(os.environ.get("CV_TRAIN_BATCH", "2"))
     workers = int(os.environ.get("CV_TRAIN_WORKERS", "4"))
     cache = os.environ.get("CV_TRAIN_CACHE", "disk")
+    patience = int(os.environ.get("CV_TRAIN_PATIENCE", "6"))
     project = str(work_root / "runs")
 
     print(f"Fine-tuning {base} for {epochs} epochs @ imgsz={imgsz} batch={batch}")
@@ -344,7 +345,7 @@ def main() -> None:
         project=project,
         name="cv_finetune",
         exist_ok=True,
-        patience=25,
+        patience=patience,
         optimizer=os.getenv("CV_TRAIN_OPTIMIZER", "AdamW"),
         lr0=float(os.getenv("CV_TRAIN_LR0", "0.0015")),
         lrf=0.01,

@@ -25,7 +25,14 @@ from train import (
 )
 
 
-THRESHOLDS = [round(x / 100, 2) for x in range(5, 80, 5)]
+if os.getenv("CV_TUNE_THRESHOLDS"):
+    THRESHOLDS = [
+        float(value.strip())
+        for value in os.environ["CV_TUNE_THRESHOLDS"].split(",")
+        if value.strip()
+    ]
+else:
+    THRESHOLDS = [round(x / 100, 2) for x in range(5, 80, 5)]
 
 
 def _load_validation_data() -> tuple[dict, list[int], dict[int, Path], dict[int, int]]:
@@ -55,6 +62,10 @@ def _load_validation_data() -> tuple[dict, list[int], dict[int, Path], dict[int,
         val_fraction=float(os.getenv("CV_TUNE_VAL_FRACTION", "0.10")),
         seed=int(os.getenv("CV_TRAIN_SPLIT_SEED", "42")),
     )
+    max_images = int(os.getenv("CV_TUNE_MAX_IMAGES", "0"))
+    if max_images > 0 and len(val_ids) > max_images:
+        val_ids = sorted(val_ids)[:max_images]
+
     image_paths = {
         int(image["id"]): src_dir / "images" / image["file_name"]
         for image in ann["images"]

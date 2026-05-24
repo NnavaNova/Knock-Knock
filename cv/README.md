@@ -76,7 +76,7 @@ cd "$HOME/knock_knock_repo"
 pip install ultralytics==8.3.146 pycocotools ensemble-boxes
 CV_TRAIN_DATA_DIR=/home/jupyter/novice/cv \
 CV_TRAIN_BASE=yolo11m.pt \
-CV_TRAIN_EPOCHS=100 \
+CV_TRAIN_EPOCHS=20 \
 CV_TRAIN_IMGSZ=1280 \
 CV_TRAIN_BATCH=2 \
 python cv/train.py            # ~30-90 min on a single GPU
@@ -84,13 +84,22 @@ python cv/tune_thresholds.py
 git add cv/src/cv_finetuned.pt cv/src/cv_thresholds.json
 git commit -m "Add tuned CV checkpoint"
 git push origin main
-til build cv cv-yolo11m-1280-e100
-til submit cv cv-yolo11m-1280-e100
+til build cv cv-yolo11m-1280-e20
+til submit cv cv-yolo11m-1280-e20
 ```
 
 Knobs (env vars to `python cv/train.py`):
 - `CV_TRAIN_DATA_DIR` — defaults to `/home/jupyter/{TEAM_TRACK}/cv`
 - `CV_TRAIN_BASE` — default `yolo11m.pt`; use this first because it stays below GitHub's normal 100 MB file limit
-- `CV_TRAIN_EPOCHS` (100), `CV_TRAIN_IMGSZ` (1280), `CV_TRAIN_BATCH` (2 on a T4)
+- `CV_TRAIN_EPOCHS` (20), `CV_TRAIN_IMGSZ` (1280), `CV_TRAIN_BATCH` (2 on a T4)
 
 The script does a deterministic class-stratified train/val split so every class is represented in validation when the data permits it.
+
+If a long run is already going and validation mAP is good, stop after a few
+epochs and submit the current best checkpoint:
+
+```bash
+cd "$HOME/knock_knock_repo"
+export TIL_FOLDER="$HOME/knock_knock_repo"
+bash cv/submit_current_best.sh
+```
