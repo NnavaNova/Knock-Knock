@@ -60,21 +60,37 @@ Note: the evaluator sets every detection's confidence to 1.0, so the model's `co
 
 ## Training the closed-vocab detector
 
-Run on the GCP Workbench (not in Docker):
+Fast path on the GCP Workbench:
 
 ```bash
 cd "$HOME/knock_knock_repo"
-pip install ultralytics==8.3.146
+export TIL_FOLDER="$HOME/knock_knock_repo"
+git pull origin main
+bash cv/workbench_train_submit.sh
+```
+
+Manual path on the GCP Workbench (not in Docker):
+
+```bash
+cd "$HOME/knock_knock_repo"
+pip install ultralytics==8.3.146 pycocotools ensemble-boxes
+CV_TRAIN_DATA_DIR=/home/jupyter/novice/cv \
+CV_TRAIN_BASE=yolo11m.pt \
+CV_TRAIN_EPOCHS=100 \
+CV_TRAIN_IMGSZ=1280 \
+CV_TRAIN_BATCH=8 \
 python cv/train.py            # ~30-90 min on a single GPU
-git add cv/src/cv_finetuned.pt
-git commit -m "Add fine-tuned CV weights"
+python cv/tune_thresholds.py
+git add cv/src/cv_finetuned.pt cv/src/cv_thresholds.json
+git commit -m "Add tuned CV checkpoint"
 git push origin main
-til build cv && til test cv && til submit cv
+til build cv cv-yolo11m-1280-e100
+til submit cv cv-yolo11m-1280-e100
 ```
 
 Knobs (env vars to `python cv/train.py`):
 - `CV_TRAIN_DATA_DIR` — defaults to `/home/jupyter/{TEAM_TRACK}/cv`
-- `CV_TRAIN_BASE` — default `yolo11x.pt`; try `yolov8x.pt` if you want the older checkpoint
-- `CV_TRAIN_EPOCHS` (60), `CV_TRAIN_IMGSZ` (1280), `CV_TRAIN_BATCH` (8)
+- `CV_TRAIN_BASE` — default `yolo11m.pt`; use this first because it stays below GitHub's normal 100 MB file limit
+- `CV_TRAIN_EPOCHS` (100), `CV_TRAIN_IMGSZ` (1280), `CV_TRAIN_BATCH` (8)
 
-The script does a deterministic 90/10 train/val split by `image_id % 10` so re-runs are reproducible.
+The script does a deterministic class-stratified train/val split so every class is represented in validation when the data permits it.

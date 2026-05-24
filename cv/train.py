@@ -68,6 +68,53 @@ def _norm_category_name(name: str) -> str:
     return " ".join(name.lower().replace("_", " ").split())
 
 
+def _build_coco_id_to_yolo(ann: dict) -> dict[int, int]:
+    """Map dataset category ids into the challenge's 0..17 class ids."""
+    official_by_name = {
+        _norm_category_name(name): idx for idx, name in enumerate(CATEGORY_NAMES)
+    }
+    aliases = {
+        "cargo airplane": 0,
+        "passenger airliner": 1,
+        "airliner": 1,
+        "fighter aircraft": 3,
+        "military aircraft": 4,
+        "small aircraft": 6,
+        "small airplane": 6,
+        "military tank": 10,
+    }
+    by_name = {**official_by_name, **aliases}
+    observed_ids = sorted(
+        {int(box["category_id"]) for box in ann.get("annotations", [])}
+    )
+
+    mapping: dict[int, int] = {}
+    for entry in ann.get("categories", []):
+        cat_id = int(entry.get("id"))
+        name = _norm_category_name(entry.get("name") or "")
+        if name in by_name:
+            mapping[cat_id] = by_name[name]
+        elif 0 <= cat_id < len(CATEGORY_NAMES):
+            mapping[cat_id] = cat_id
+        elif 1 <= cat_id <= len(CATEGORY_NAMES):
+            mapping[cat_id] = cat_id - 1
+
+    if not mapping:
+        if observed_ids and min(observed_ids) >= 1 and max(observed_ids) <= len(CATEGORY_NAMES):
+            mapping = {cat_id: cat_id - 1 for cat_id in observed_ids}
+        else:
+            mapping = {
+                cat_id: cat_id
+                for cat_id in observed_ids
+                if 0 <= cat_id < len(CATEGORY_NAMES)
+            }
+
+    missing = sorted(set(observed_ids) - set(mapping))
+    if missing:
+        print(f"Warning: unmapped category ids will be skipped: {missing}")
+    return mapping
+
+
 def _resolve_data_dir() -> Path:
     """Find the public CV data directory on the Workbench."""
     explicit = os.environ.get("CV_TRAIN_DATA_DIR")
@@ -110,29 +157,8 @@ def _convert_coco_to_yolo(src_dir: Path, out_dir: Path) -> tuple[Path, Path]:
     with ann_path.open() as f:
         ann = json.load(f)
 
-    # Build the COCO-id -> 0..17 category index. The dataset's category_id
-    # ordering must match CATEGORY_NAMES, which by construction matches
-    # the challenge category_id space, so this is straight identity in
-    # practice — but we re-derive it defensively in case the annotations
-    # JSON ever permutes categories.
-    coco_cats = ann.get("categories", [])
-    # If categories use the [0..17] ids, identity. Otherwise map by name.
-    coco_id_to_yolo: dict[int, int] = {}
-    official_by_name = {
-        _norm_category_name(name): idx for idx, name in enumerate(CATEGORY_NAMES)
-    }
-    if coco_cats:
-        for entry in coco_cats:
-            cat_id = entry.get("id")
-            name = _norm_category_name(entry.get("name") or "")
-            if name in official_by_name:
-                coco_id_to_yolo[int(cat_id)] = official_by_name[name]
-            elif isinstance(cat_id, int) and 0 <= cat_id < len(CATEGORY_NAMES):
-                # Annotations use raw 0..17 ids without names — trust the id.
-                coco_id_to_yolo[int(cat_id)] = int(cat_id)
-    else:
-        # Annotations lack a categories array; assume raw 0..17 ids.
-        coco_id_to_yolo = {i: i for i in range(len(CATEGORY_NAMES))}
+    coco_id_to_yolo = _build_coco_id_to_yolo(ann)
+    print(f"Category mapping: {coco_id_to_yolo}")
 
     images_by_id: dict[int, dict] = {img["id"]: img for img in ann["images"]}
     boxes_by_image: dict[int, list[dict]] = defaultdict(list)
@@ -335,6 +361,9 @@ def main() -> None:
         hsv_v=0.25,
         cache="disk",
         workers=8,
+        seed=int(os.getenv("CV_TRAIN_SEED", "42")),
+        deterministic=False,
+        amp=True,
         plots=True,
     )
 

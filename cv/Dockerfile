@@ -20,6 +20,8 @@ ENV CV_IMGSZ=1280
 ENV CV_CONF=0.30
 ENV CV_IOU=0.55
 ENV CV_MAX_DET=60
+ENV CV_MAX_DET_FINETUNED=120
+ENV CV_MAX_DET_FALLBACK=60
 ENV CV_TTA=auto
 ENV CV_WBF_IOU=0.55
 ENV CV_WBF_SKIP=0.001
@@ -46,7 +48,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Pre-download the YOLO-World fallback weights so first-call latency stays low.
 # Use the same descriptive single-prompt-per-category list that cv_manager.py
 # applies at runtime; this is what gets cached into the model file.
-RUN python -c "from ultralytics import YOLOWorld; import os; model = YOLOWorld(os.environ['CV_MODEL_NAME']); model.set_classes(['cargo airplane','passenger airliner','drone','fighter jet','military propeller airplane','helicopter','small private airplane','missile','truck','car','military tank','bus','van','cargo ship','yacht','cruise ship','warship','sailboat'])"
+RUN python -c "from ultralytics import YOLOWorld; import os; model = YOLOWorld(os.environ['CV_MODEL_NAME']); model.set_classes(['cargo aircraft','commercial aircraft','drone','fighter jet','fighter plane','helicopter','light aircraft','missile','truck','car','tank','bus','van','cargo ship','yacht','cruise ship','warship','sailboat'])"
 
 # Copies your source files. If cv_finetuned.pt is included in src/, the
 # manager will prefer it over the YOLO-World fallback.

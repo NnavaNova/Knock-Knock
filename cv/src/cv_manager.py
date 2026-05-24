@@ -31,17 +31,17 @@ LOGGER = logging.getLogger(__name__)
 # multiple competing embeddings for the same visual concept. These prompts
 # were picked to be unambiguous and well-represented in LVIS-style data.
 CATEGORY_PROMPTS = {
-    0: "cargo airplane",
-    1: "passenger airliner",
+    0: "cargo aircraft",
+    1: "commercial aircraft",
     2: "drone",
     3: "fighter jet",
-    4: "military propeller airplane",
+    4: "fighter plane",
     5: "helicopter",
-    6: "small private airplane",
+    6: "light aircraft",
     7: "missile",
     8: "truck",
     9: "car",
-    10: "military tank",
+    10: "tank",
     11: "bus",
     12: "van",
     13: "cargo ship",
@@ -71,6 +71,8 @@ class CVManager:
         self.confidence = float(os.getenv("CV_CONF", "0.30"))
         self.iou = float(os.getenv("CV_IOU", "0.55"))
         self.max_det = int(os.getenv("CV_MAX_DET", "60"))
+        self.max_det_finetuned = int(os.getenv("CV_MAX_DET_FINETUNED", "120"))
+        self.max_det_fallback = int(os.getenv("CV_MAX_DET_FALLBACK", str(self.max_det)))
         self.tta_setting = os.getenv("CV_TTA", "auto").strip().lower()
         self.use_tta = self.tta_setting not in {"0", "false", "off", "no"}
         self.wbf_iou = float(os.getenv("CV_WBF_IOU", "0.55"))
@@ -206,7 +208,9 @@ class CVManager:
                 imgsz=self.image_size,
                 conf=min(self.class_thresholds.values(), default=self.confidence),
                 iou=self.iou,
-                max_det=self.max_det,
+                max_det=self.max_det_finetuned
+                if self.is_finetuned
+                else self.max_det_fallback,
                 agnostic_nms=False,
                 verbose=False,
             )
@@ -379,6 +383,7 @@ class CVManager:
                 continue
             out.append(
                 {
+                    "score": float(score),
                     "bbox": [
                         round(left, 2),
                         round(top, 2),
@@ -390,9 +395,14 @@ class CVManager:
             )
 
         # Sort by descending score so the most-confident detections appear
-        # first in the response. The evaluator ignores ordering, but this is
-        # nicer for downstream debugging.
-        return out
+        # first. The local evaluator rewrites all scores to 1.0, so preserving
+        # confidence order is still useful when COCOEval breaks ties stably.
+        out.sort(key=lambda det: det["score"], reverse=True)
+        limit = self.max_det_finetuned if self.is_finetuned else self.max_det_fallback
+        return [
+            {"bbox": det["bbox"], "category_id": det["category_id"]}
+            for det in out[:limit]
+        ]
 
     def _fallback_merge(
         self,
@@ -436,7 +446,8 @@ class CVManager:
                     "category_id": int(det["category_id"]),
                 }
             )
-        return out
+        limit = self.max_det_finetuned if self.is_finetuned else self.max_det_fallback
+        return out[:limit]
 
     @staticmethod
     def _xyxy_iou(a: dict[str, Any], b: dict[str, Any]) -> float:

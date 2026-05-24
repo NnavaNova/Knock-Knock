@@ -17,17 +17,23 @@ from pycocotools.cocoeval import COCOeval
 from tqdm import tqdm
 from ultralytics import YOLO
 
-from train import _resolve_data_dir, _stratified_split
+from train import (
+    CATEGORY_NAMES,
+    _build_coco_id_to_yolo,
+    _resolve_data_dir,
+    _stratified_split,
+)
 
 
 THRESHOLDS = [round(x / 100, 2) for x in range(5, 80, 5)]
 
 
-def _load_validation_data() -> tuple[dict, list[int], dict[int, Path]]:
+def _load_validation_data() -> tuple[dict, list[int], dict[int, Path], dict[int, int]]:
     src_dir = _resolve_data_dir()
     with (src_dir / "annotations.json").open() as f:
         ann = json.load(f)
 
+    coco_id_to_yolo = _build_coco_id_to_yolo(ann)
     boxes_by_image: dict[int, list[dict]] = {}
     image_classes: dict[int, set[int]] = {}
     class_to_images: dict[int, list[int]] = {}
@@ -35,7 +41,9 @@ def _load_validation_data() -> tuple[dict, list[int], dict[int, Path]]:
         image_classes[int(image["id"])] = set()
     for box in ann.get("annotations", []):
         img_id = int(box["image_id"])
-        cls_id = int(box["category_id"])
+        cls_id = coco_id_to_yolo.get(int(box["category_id"]))
+        if cls_id is None:
+            continue
         boxes_by_image.setdefault(img_id, []).append(box)
         image_classes.setdefault(img_id, set()).add(cls_id)
         class_to_images.setdefault(cls_id, []).append(img_id)
@@ -51,22 +59,30 @@ def _load_validation_data() -> tuple[dict, list[int], dict[int, Path]]:
         int(image["id"]): src_dir / "images" / image["file_name"]
         for image in ann["images"]
     }
-    return ann, val_ids, image_paths
+    return ann, val_ids, image_paths, coco_id_to_yolo
 
 
-def _val_ground_truth(ann: dict, val_ids: list[int], out_path: Path) -> COCO:
+def _val_ground_truth(
+    ann: dict, val_ids: list[int], coco_id_to_yolo: dict[int, int], out_path: Path
+) -> COCO:
     val_set = set(val_ids)
+    converted_annotations = []
+    for box in ann.get("annotations", []):
+        if int(box["image_id"]) not in val_set:
+            continue
+        mapped = coco_id_to_yolo.get(int(box["category_id"]))
+        if mapped is None:
+            continue
+        converted = dict(box)
+        converted["category_id"] = mapped
+        converted_annotations.append(converted)
     gt = {
         "images": [img for img in ann["images"] if int(img["id"]) in val_set],
-        "annotations": [
-            box
-            for box in ann.get("annotations", [])
-            if int(box["image_id"]) in val_set
+        "annotations": converted_annotations,
+        "categories": [
+            {"id": idx, "name": name}
+            for idx, name in enumerate(CATEGORY_NAMES)
         ],
-        "categories": ann.get(
-            "categories",
-            [{"id": i, "name": str(i)} for i in range(18)],
-        ),
     }
     out_path.write_text(json.dumps(gt))
     return COCO(str(out_path))
@@ -123,12 +139,14 @@ def main() -> None:
     if not model_path.exists():
         raise FileNotFoundError(f"Missing model: {model_path}")
 
-    ann, val_ids, image_paths = _load_validation_data()
+    ann, val_ids, image_paths, coco_id_to_yolo = _load_validation_data()
     raw_detections = _predict_raw(model_path, val_ids, image_paths)
     thresholds = {cls_id: 0.30 for cls_id in range(18)}
 
     with tempfile.TemporaryDirectory() as tmp:
-        coco_gt = _val_ground_truth(ann, val_ids, Path(tmp) / "val_gt.json")
+        coco_gt = _val_ground_truth(
+            ann, val_ids, coco_id_to_yolo, Path(tmp) / "val_gt.json"
+        )
         best_score = _score(
             coco_gt,
             [
