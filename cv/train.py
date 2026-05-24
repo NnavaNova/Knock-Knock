@@ -329,7 +329,9 @@ def main() -> None:
     base = os.environ.get("CV_TRAIN_BASE", "yolo11m.pt")
     epochs = int(os.environ.get("CV_TRAIN_EPOCHS", "100"))
     imgsz = int(os.environ.get("CV_TRAIN_IMGSZ", "1280"))
-    batch = int(os.environ.get("CV_TRAIN_BATCH", "8"))
+    batch = int(os.environ.get("CV_TRAIN_BATCH", "2"))
+    workers = int(os.environ.get("CV_TRAIN_WORKERS", "4"))
+    cache = os.environ.get("CV_TRAIN_CACHE", "disk")
     project = str(work_root / "runs")
 
     print(f"Fine-tuning {base} for {epochs} epochs @ imgsz={imgsz} batch={batch}")
@@ -359,8 +361,8 @@ def main() -> None:
         hsv_h=0.015,
         hsv_s=0.45,
         hsv_v=0.25,
-        cache="disk",
-        workers=8,
+        cache=cache,
+        workers=workers,
         seed=int(os.getenv("CV_TRAIN_SEED", "42")),
         deterministic=False,
         amp=True,

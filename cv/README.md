@@ -78,7 +78,7 @@ CV_TRAIN_DATA_DIR=/home/jupyter/novice/cv \
 CV_TRAIN_BASE=yolo11m.pt \
 CV_TRAIN_EPOCHS=100 \
 CV_TRAIN_IMGSZ=1280 \
-CV_TRAIN_BATCH=8 \
+CV_TRAIN_BATCH=2 \
 python cv/train.py            # ~30-90 min on a single GPU
 python cv/tune_thresholds.py
 git add cv/src/cv_finetuned.pt cv/src/cv_thresholds.json
@@ -91,6 +91,6 @@ til submit cv cv-yolo11m-1280-e100
 Knobs (env vars to `python cv/train.py`):
 - `CV_TRAIN_DATA_DIR` — defaults to `/home/jupyter/{TEAM_TRACK}/cv`
 - `CV_TRAIN_BASE` — default `yolo11m.pt`; use this first because it stays below GitHub's normal 100 MB file limit
-- `CV_TRAIN_EPOCHS` (100), `CV_TRAIN_IMGSZ` (1280), `CV_TRAIN_BATCH` (8)
+- `CV_TRAIN_EPOCHS` (100), `CV_TRAIN_IMGSZ` (1280), `CV_TRAIN_BATCH` (2 on a T4)
 
 The script does a deterministic class-stratified train/val split so every class is represented in validation when the data permits it.
