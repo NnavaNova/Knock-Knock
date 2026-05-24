@@ -58,13 +58,14 @@ RESPAWN_STEPS = 40
 MISSION_MULT = float(os.getenv("AE_MISSION_MULT", "1.5"))
 RESOURCE_MULT = float(os.getenv("AE_RESOURCE_MULT", "1.6"))
 RECON_MULT = float(os.getenv("AE_RECON_MULT", "0.6"))
-VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.10"))
+VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.05"))
 BOMB_BASE_BONUS = float(os.getenv("AE_BOMB_BASE_BONUS", "35"))
 DESTRUCTIBLE_OPEN_THRESHOLD = float(os.getenv("AE_DESTRUCTIBLE_OPEN_THRESHOLD", "5"))
 BASE_RUSH_STEP = int(os.getenv("AE_BASE_RUSH_STEP", "60"))
 CLOSE_COMBAT_DISTANCE = int(os.getenv("AE_CLOSE_COMBAT_DISTANCE", "6"))
 GOOD_COLLECTIBLE_SCORE = float(os.getenv("AE_GOOD_COLLECTIBLE_SCORE", "0.75"))
 LOW_BOMB_RESOURCE_BONUS = float(os.getenv("AE_LOW_BOMB_RESOURCE_BONUS", "1.0"))
+FIXED_MISS_LIMIT = int(os.getenv("AE_FIXED_MISS_LIMIT", "2"))
 
 Coord = tuple[int, int]
 Edge = tuple[Coord, Coord]
@@ -128,6 +129,8 @@ class AEManager:
         self.fixed_collectibles: set[Coord] = set()
         self.fixed_respawns: dict[Coord, int] = {}
         self.fixed_base_locations: set[Coord] = set()
+        self.fixed_collectible_misses: defaultdict[Coord, int] = defaultdict(int)
+        self.dismissed_fixed_bases: set[Coord] = set()
         self.collected_until: dict[Coord, int] = {}
         self.ally_bases: set[Coord] = set()
         self.enemy_bases: dict[Coord, TargetInfo] = {}
@@ -281,14 +284,23 @@ class AEManager:
                 break
         if found is None:
             previous = self.collectibles.pop(pos, None)
-            if previous is not None:
-                self.known_collectibles[pos] = previous
+            known = previous or self.known_collectibles.get(pos)
+            if known is not None:
+                if pos in self.fixed_collectibles:
+                    self.fixed_collectible_misses[pos] += 1
+                    if self.fixed_collectible_misses[pos] >= FIXED_MISS_LIMIT:
+                        self.fixed_collectibles.discard(pos)
+                        self.known_collectibles.pop(pos, None)
+                        self.collected_until.pop(pos, None)
+                        return
+                self.known_collectibles[pos] = known
                 self.collected_until[pos] = max(
                     self.collected_until.get(pos, 0), step + self._respawn_steps(pos)
                 )
         else:
             self.collectibles[pos] = found
             self.known_collectibles[pos] = found
+            self.fixed_collectible_misses.pop(pos, None)
             self.collected_until.pop(pos, None)
 
     def _update_entities(self, pos: Coord, cell: np.ndarray, step: int) -> None:
@@ -298,8 +310,11 @@ class AEManager:
         if cell[CH_ENEMY_BASE] > 0.5:
             health = float(cell[CH_ENEMY_BASE_HEALTH] or 1.0)
             self.enemy_bases[pos] = TargetInfo("enemy_base", 80.0 + 40.0 * health, step)
+            self.dismissed_fixed_bases.discard(pos)
         else:
             self.enemy_bases.pop(pos, None)
+            if pos in self.fixed_base_locations:
+                self.dismissed_fixed_bases.add(pos)
 
         if cell[CH_ENEMY_AGENT] > 0.5:
             health = float(cell[CH_ENEMY_AGENT_HEALTH] or 1.0)
@@ -456,6 +471,17 @@ class AEManager:
                         )
                     )
 
+        for base_pos in self._suspected_enemy_bases():
+            for pos in self._bombing_positions(base_pos):
+                if self._in_bounds(pos) and not self._cell_blocked(pos):
+                    candidates.append(
+                        (
+                            self._combat_target_value("suspected_enemy_base", step),
+                            pos,
+                            "suspected_enemy_base",
+                        )
+                    )
+
         for enemy_pos, info in self.enemies.items():
             for pos in self._bombing_positions(enemy_pos):
                 if self._in_bounds(pos) and not self._cell_blocked(pos):
@@ -496,7 +522,10 @@ class AEManager:
                 - VISIT_PENALTY * self.visited[target]
                 - 4.0 * risk_penalty
             )
-            if kind not in ("enemy_base", "enemy") and score > best_collectible_score:
+            if (
+                kind not in ("enemy_base", "enemy", "suspected_enemy_base")
+                and score > best_collectible_score
+            ):
                 best_collectible_score = score
                 best_collectible = result
             if score > best_score:
@@ -506,7 +535,7 @@ class AEManager:
 
         if best is not None and best_score > 0.05:
             if (
-                best_kind in ("enemy_base", "enemy")
+                best_kind in ("enemy_base", "enemy", "suspected_enemy_base")
                 and step < BASE_RUSH_STEP
                 and best.distance > CLOSE_COMBAT_DISTANCE
                 and best_collectible is not None
@@ -830,6 +859,15 @@ class AEManager:
                         / (result.distance + 1.0)
                     )
                     break
+        for base_pos in self._suspected_enemy_bases():
+            for pos in self._bombing_positions(base_pos):
+                result = self._best_reachable_result(reachable, pos)
+                if result is not None:
+                    value += (
+                        self._combat_target_value("suspected_enemy_base", step)
+                        / (result.distance + 1.0)
+                    )
+                    break
         return value
 
     def _escape_exists_after_bomb(self, location: Coord, direction: int) -> bool:
@@ -986,10 +1024,16 @@ class AEManager:
             if base == own_base:
                 self.ally_bases.add(base)
                 self.enemy_bases.pop(base, None)
-            else:
-                self.enemy_bases.setdefault(
-                    base, TargetInfo("enemy_base", 100.0, step)
-                )
+                self.dismissed_fixed_bases.add(base)
+
+    def _suspected_enemy_bases(self) -> set[Coord]:
+        return {
+            base
+            for base in self.fixed_base_locations
+            if base not in self.ally_bases
+            and base not in self.enemy_bases
+            and base not in self.dismissed_fixed_bases
+        }
 
     def _respawn_steps(self, pos: Coord) -> int:
         return max(5, int(self.fixed_respawns.get(pos, RESPAWN_STEPS)))
@@ -998,6 +1042,8 @@ class AEManager:
     def _combat_target_value(kind: str, step: int) -> float:
         if kind == "enemy_base":
             return 12.0 if step < BASE_RUSH_STEP else 60.0
+        if kind == "suspected_enemy_base":
+            return 8.0 if step < BASE_RUSH_STEP else 36.0
         if kind == "enemy":
             return 10.0 if step < BASE_RUSH_STEP else 18.0
         return 0.0

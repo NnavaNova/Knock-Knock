@@ -23,12 +23,13 @@ GRID = {
     "MISSION_MULT": [1.2, 1.5, 1.8],
     "RESOURCE_MULT": [1.2, 1.6, 2.0],
     "RECON_MULT": [0.4, 0.6, 0.8],
-    "VISIT_PENALTY": [0.10, 0.15, 0.20],
+    "VISIT_PENALTY": [0.05, 0.10, 0.15],
     "BOMB_BASE_BONUS": [24.0, 35.0, 45.0],
     "MAX_PLAN_DEPTH": [32, 40, 48],
     "DESTRUCTIBLE_OPEN_THRESHOLD": [3.0, 5.0, 8.0],
     "BASE_RUSH_STEP": [45, 60, 90],
     "GOOD_COLLECTIBLE_SCORE": [0.5, 0.75, 1.0],
+    "FIXED_MISS_LIMIT": [1, 2, 3],
 }
 
 
@@ -49,6 +50,7 @@ def _apply_config(config: dict[str, float]) -> None:
     policy.DESTRUCTIBLE_OPEN_THRESHOLD = float(config["DESTRUCTIBLE_OPEN_THRESHOLD"])
     policy.BASE_RUSH_STEP = int(config["BASE_RUSH_STEP"])
     policy.GOOD_COLLECTIBLE_SCORE = float(config["GOOD_COLLECTIBLE_SCORE"])
+    policy.FIXED_MISS_LIMIT = int(config["FIXED_MISS_LIMIT"])
     policy.TARGET_MULTIPLIERS.update(
         {
             "mission": policy.MISSION_MULT,
@@ -75,8 +77,9 @@ def _run_config(config: dict[str, float], rounds: int) -> float:
         _ = manager.reset()
         round_reward = 0.0
         for agent in env.agent_iter():
-            observation, _reward, termination, truncation, _info = env.last()
-            round_reward += float(env.rewards.get(controlled_agent, 0.0))
+            observation, reward, termination, truncation, _info = env.last()
+            if agent == controlled_agent:
+                round_reward += float(reward)
             if termination or truncation:
                 action = None
             elif agent == controlled_agent:
