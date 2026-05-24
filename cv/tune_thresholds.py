@@ -33,6 +33,13 @@ if os.getenv("CV_TUNE_THRESHOLDS"):
     ]
 else:
     THRESHOLDS = [round(x / 100, 2) for x in range(5, 80, 5)]
+MIN_THRESHOLD = float(os.getenv("CV_TUNE_MIN_THRESHOLD", "0.05"))
+MAX_THRESHOLD = float(os.getenv("CV_TUNE_MAX_THRESHOLD", "0.45"))
+THRESHOLDS = [
+    threshold
+    for threshold in THRESHOLDS
+    if MIN_THRESHOLD <= threshold <= MAX_THRESHOLD
+]
 
 
 def _load_validation_data() -> tuple[dict, list[int], dict[int, Path], dict[int, int]]:

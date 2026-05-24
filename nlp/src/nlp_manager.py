@@ -122,6 +122,23 @@ class NLPManager:
         self.emb_model = None
         self.doc_embeddings = None  # torch.Tensor (n_docs, dim) on qa_device
         self.chunk_embeddings = None  # torch.Tensor (n_chunks, dim) on qa_device
+        self._query_embedding_cache: dict[str, object] = {}
+        self.fast_direct = os.getenv("NLP_FAST_DIRECT", "1").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
+        self.max_model_contexts = int(os.getenv("NLP_MAX_MODEL_CONTEXTS", "4"))
+        self.model_max_length = int(os.getenv("NLP_MODEL_MAX_LENGTH", "320"))
+        self.model_stride = int(os.getenv("NLP_MODEL_STRIDE", "96"))
+        self.model_topk = int(os.getenv("NLP_MODEL_TOPK", "8"))
+        self.use_dense_chunks = os.getenv("NLP_DENSE_CHUNKS", "1").strip().lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
         self.candidate_ranker = self._load_candidate_ranker()
         self._load_qa_model()
         self._load_embedding_model()
@@ -143,6 +160,7 @@ class NLPManager:
         self.document_frequency = {}
         self.doc_embeddings = None
         self.chunk_embeddings = None
+        self._query_embedding_cache = {}
 
         for doc_id, raw_document in enumerate(documents):
             document_id, document = self._normalize_document(raw_document, doc_id)
@@ -193,11 +211,12 @@ class NLPManager:
             except Exception:
                 self.doc_embeddings = None
 
-            try:
-                chunk_texts = [chunk.text[:900] for chunk in self.chunks]
-                self.chunk_embeddings = self._embed(chunk_texts)
-            except Exception:
-                self.chunk_embeddings = None
+            if self.use_dense_chunks:
+                try:
+                    chunk_texts = [chunk.text[:900] for chunk in self.chunks]
+                    self.chunk_embeddings = self._embed(chunk_texts)
+                except Exception:
+                    self.chunk_embeddings = None
 
         self.loaded = True
 
@@ -232,6 +251,10 @@ class NLPManager:
     ) -> str:
         candidates: list[AnswerCandidate] = []
 
+        direct_answer = self._direct_answer(question, ranked_chunks)
+        if direct_answer and self.fast_direct and self._high_confidence_direct(question):
+            return self._clean_answer_phrase(direct_answer)
+
         # Generative path (FLAN-T5 or similar). When a seq2seq model is
         # loaded, we trust its synthesized answer first — it can reshape,
         # paraphrase, and lightly compute in ways the extractive head can't.
@@ -255,7 +278,6 @@ class NLPManager:
                 )
             )
 
-        direct_answer = self._direct_answer(question, ranked_chunks)
         if direct_answer:
             candidates.append(
                 self._make_candidate(direct_answer, "direct", 8.0, ranked_chunks)
@@ -456,6 +478,37 @@ class NLPManager:
             return value
 
         return max(valid, key=score).answer
+
+    def _high_confidence_direct(self, question: str) -> bool:
+        question_lower = question.lower()
+        markers = (
+            "how many",
+            "how much",
+            "how far",
+            "how long",
+            "what share",
+            "what fraction",
+            "what proportion",
+            "what percentage",
+            "by how many",
+            "by what score",
+            "at what date",
+            "what date",
+            "deadline",
+            "penalt",
+            "codename",
+            "talking point",
+            "governance status",
+            "what industry",
+            "come from",
+            "from which",
+            "remain without power",
+            "crew",
+            "recoup",
+            "revenue",
+            "between",
+        )
+        return any(marker in question_lower for marker in markers)
 
     def _ranker_adjustment(self, candidate: AnswerCandidate) -> float:
         weights = self.candidate_ranker or {}
@@ -732,7 +785,8 @@ class NLPManager:
             return []
 
         query_counts = Counter(query_tokens)
-        ranked_doc_ids = self._rank_docs(question, limit=6)
+        query_emb = self._query_embedding(question)
+        ranked_doc_ids = self._rank_docs(question, limit=6, query_emb=query_emb)
         if not ranked_doc_ids:
             return []
 
@@ -797,7 +851,7 @@ class NLPManager:
             elif chunk.word_count < 8:
                 scores[chunk_id] *= 0.9
 
-        dense_chunk_scores = self._dense_chunk_scores(question)
+        dense_chunk_scores = self._dense_chunk_scores(question, query_emb=query_emb)
         if dense_chunk_scores is not None and scores:
             bm25_max = max(scores.values()) or 1.0
             if bm25_max <= 0:
@@ -819,7 +873,9 @@ class NLPManager:
         reranked.sort(key=lambda item: item[0], reverse=True)
         return reranked[:limit]
 
-    def _rank_docs(self, question: str, limit: int = 5) -> list[tuple[int, float]]:
+    def _rank_docs(
+        self, question: str, limit: int = 5, query_emb=None
+    ) -> list[tuple[int, float]]:
         query_tokens = self._tokenize(question)
         if not query_tokens:
             return []
@@ -864,7 +920,7 @@ class NLPManager:
         # excels at entity/codename matching (which our corpus is full of);
         # dense embeddings recover paraphrased queries where BM25 misses.
         if self.doc_embeddings is not None:
-            dense_scores = self._dense_doc_scores(question)
+            dense_scores = self._dense_doc_scores(question, query_emb=query_emb)
             if dense_scores is not None:
                 bm25_max = max(scores.values()) if scores else 1.0
                 if bm25_max <= 0:
@@ -883,14 +939,29 @@ class NLPManager:
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         return ranked[:limit]
 
-    def _dense_doc_scores(self, question: str):
+    def _query_embedding(self, question: str):
+        if self.emb_model is None or self.emb_tokenizer is None:
+            return None
+        key = question.strip().lower()
+        cached = self._query_embedding_cache.get(key)
+        if cached is not None:
+            return cached
+        query_emb = self._embed([question])
+        if query_emb is not None:
+            if len(self._query_embedding_cache) > 128:
+                self._query_embedding_cache.clear()
+            self._query_embedding_cache[key] = query_emb
+        return query_emb
+
+    def _dense_doc_scores(self, question: str, query_emb=None):
         """Cosine similarity of question against pre-computed doc embeddings."""
         if self.doc_embeddings is None or self.emb_model is None:
             return None
         try:
             import torch  # noqa: F401
 
-            query_emb = self._embed([question])
+            if query_emb is None:
+                query_emb = self._query_embedding(question)
             if query_emb is None:
                 return None
             sims = (self.doc_embeddings @ query_emb[0]).tolist()
@@ -898,12 +969,13 @@ class NLPManager:
         except Exception:
             return None
 
-    def _dense_chunk_scores(self, question: str):
+    def _dense_chunk_scores(self, question: str, query_emb=None):
         """Cosine similarity of question against pre-computed chunk embeddings."""
         if self.chunk_embeddings is None or self.emb_model is None:
             return None
         try:
-            query_emb = self._embed([question])
+            if query_emb is None:
+                query_emb = self._query_embedding(question)
             if query_emb is None:
                 return None
             return (self.chunk_embeddings @ query_emb[0]).tolist()
@@ -2739,7 +2811,7 @@ class NLPManager:
                 continue
             seen_keys.add(key)
             contexts.append(text)
-            if len(contexts) >= 6:
+            if len(contexts) >= max(1, self.max_model_contexts):
                 break
 
         if not contexts:
@@ -2760,9 +2832,9 @@ class NLPManager:
             inputs = self.qa_tokenizer(
                 [question] * len(contexts),
                 contexts,
-                max_length=384,
+                max_length=self.model_max_length,
                 truncation="only_second",
-                stride=128,
+                stride=self.model_stride,
                 return_overflowing_tokens=True,
                 return_offsets_mapping=True,
                 padding="max_length",
@@ -2809,7 +2881,7 @@ class NLPManager:
             valid_start_lp = start_logprob[valid_t]
             valid_end_lp = end_logprob[valid_t]
 
-            topk = min(15, len(valid))
+            topk = min(max(4, self.model_topk), len(valid))
             top_start_idx = torch.topk(valid_start_lp, k=topk).indices.tolist()
             top_end_idx = torch.topk(valid_end_lp, k=topk).indices.tolist()
 

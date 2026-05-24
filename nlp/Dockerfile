@@ -13,6 +13,12 @@ ENV PIP_ROOT_USER_ACTION=ignore
 WORKDIR /workspace
 ENV QA_MODEL_NAME=deepset/deberta-v3-base-squad2
 ENV EMB_MODEL_NAME=sentence-transformers/multi-qa-MiniLM-L6-cos-v1
+ENV NLP_FAST_DIRECT=1
+ENV NLP_MAX_MODEL_CONTEXTS=4
+ENV NLP_MODEL_MAX_LENGTH=320
+ENV NLP_MODEL_STRIDE=96
+ENV NLP_MODEL_TOPK=8
+ENV NLP_DENSE_CHUNKS=1
 
 # Installs your dependencies.
 RUN pip install -U pip

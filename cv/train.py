@@ -184,6 +184,14 @@ def _convert_coco_to_yolo(src_dir: Path, out_dir: Path) -> tuple[Path, Path]:
         val_fraction=float(os.getenv("CV_TRAIN_VAL_FRACTION", "0.10")),
         seed=int(os.getenv("CV_TRAIN_SPLIT_SEED", "42")),
     )
+    if os.getenv("CV_TRAIN_INCLUDE_VAL", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        train_ids = sorted(set(train_ids) | set(val_ids))
+        print("Training split includes validation images for final full-data fit")
     print(f"Train: {len(train_ids)} images   Val: {len(val_ids)} images")
 
     img_root = out_dir / "images"
@@ -367,6 +375,10 @@ def main() -> None:
         seed=int(os.getenv("CV_TRAIN_SEED", "42")),
         deterministic=False,
         amp=True,
+        erasing=float(os.getenv("CV_TRAIN_ERASING", "0.0")),
+        dropout=float(os.getenv("CV_TRAIN_DROPOUT", "0.0")),
+        multi_scale=os.getenv("CV_TRAIN_MULTI_SCALE", "0").strip().lower()
+        in {"1", "true", "yes", "on"},
         plots=True,
     )
 
